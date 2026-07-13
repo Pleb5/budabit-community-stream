@@ -86,6 +86,7 @@
   let loadingStreams = $state(false);
   let hasLoadedStreams = $state(false);
   let loadError = $state("");
+  let expanded = $state(false);
   let joinedAddress = $state("");
   let setupOpen = $state(false);
   let widgetTheme = $state<WidgetTheme>("light");
@@ -270,6 +271,7 @@
     streams = [];
     hasLoadedStreams = false;
     loadError = "";
+    expanded = false;
     joinedAddress = "";
     setupOpen = false;
     closeStreamSubscriptions();
@@ -340,16 +342,24 @@
         return;
       }
       if (!responseMatchesContext(response, expected)) return;
-      loadError = "";
-      hasLoadedStreams = true;
+      const wasLoaded = hasLoadedStreams;
+      const wasLive = streams.some((stream) => stream.status === "live");
       const nextStreams = response.events
         .filter((event): event is Event => verifyEvent(event as Event))
         .map((event) => parseStreamEvent(event, trustedProviders))
         .filter((stream): stream is CommunityStream => Boolean(stream))
         .sort(compareStreams);
+      loadError = "";
+      hasLoadedStreams = true;
       if (!sameStreams(streams, nextStreams)) {
         streams = nextStreams;
         syncStreamSubscriptions(nextStreams);
+      }
+      if (
+        nextStreams.some((stream) => stream.status === "live") &&
+        (!wasLoaded || !wasLive)
+      ) {
+        expanded = true;
       }
       if (
         joinedAddress &&
@@ -384,8 +394,14 @@
     );
   }
 
+  function toggleExpanded() {
+    expanded = !expanded;
+    scheduleHostResize();
+  }
+
   function openSetup() {
     if (!canModerate) return;
+    expanded = true;
     setupOpen = true;
     providerError = "";
     scheduleHostResize();
@@ -1045,6 +1061,7 @@
 
   $effect(() => {
     streams;
+    expanded;
     joinedAddress;
     setupOpen;
     providerLoading;
@@ -1096,7 +1113,7 @@
 
 <main bind:this={mainElement}>
   <section class="shell">
-    <header class="masthead">
+    <header class="masthead" class:compacted={!expanded}>
       <div class="signal" aria-hidden="true"><span></span><i></i><b></b></div>
       <div class="masthead-copy">
         <p class="eyebrow">Community broadcast</p>
@@ -1117,7 +1134,7 @@
       </div>
       <div class="masthead-actions">
         <button
-          class="icon-button"
+          class="icon-button refresh-action"
           onclick={() => void loadStreams()}
           disabled={loadingStreams}
           title="Refresh streams"
@@ -1125,21 +1142,33 @@
           <span class:spin={loadingStreams}>↻</span>
         </button>
         {#if canModerate}
-          <button class="primary compact" onclick={openSetup}
+          <button class="primary compact studio-action" onclick={openSetup}
             >Start a stream</button
           >
         {/if}
+        <button
+          class="accordion-toggle"
+          class:expanded
+          onclick={toggleExpanded}
+          aria-expanded={expanded}
+          aria-controls="community-stream-panel"
+        >
+          <span>{expanded ? "Collapse" : "Expand"}</span>
+          <b aria-hidden="true">⌄</b>
+        </button>
       </div>
     </header>
 
-    {#if !communityContext}
-      <div class="notice">Waiting for BudaBit community context…</div>
-    {:else}
-      {#if loadError}<div class="notice error" role="alert">
-          {loadError}
-        </div>{/if}
+    {#if expanded}
+      <div id="community-stream-panel" class="accordion-panel">
+        {#if !communityContext}
+          <div class="notice">Waiting for BudaBit community context…</div>
+        {:else}
+          {#if loadError}<div class="notice error" role="alert">
+              {loadError}
+            </div>{/if}
 
-      {#if setupOpen && canModerate}
+          {#if setupOpen && canModerate}
         <section class="setup" aria-labelledby="setup-title">
           <div class="section-heading">
             <div>
@@ -1296,9 +1325,9 @@
               {providerError}
             </div>{/if}
         </section>
-      {/if}
+          {/if}
 
-      {#if selectedStream && joinedAddress}
+          {#if selectedStream && joinedAddress}
         <section class="stage">
           <div class="stage-heading">
             <div>
@@ -1407,9 +1436,9 @@
             </aside>
           </div>
         </section>
-      {/if}
+          {/if}
 
-      {#if liveStreams.length || plannedStreams.length || recentStreams.length}
+          {#if liveStreams.length || plannedStreams.length || recentStreams.length}
         <div class="stream-list">
           {#each [...liveStreams, ...plannedStreams, ...recentStreams] as stream (stream.address)}
             <article
@@ -1458,7 +1487,7 @@
             </article>
           {/each}
         </div>
-      {:else}
+          {:else}
         <div class="offline">
           <div class="offline-orbit"><span></span></div>
           <div>
@@ -1479,7 +1508,9 @@
               >Open studio</button
             >{/if}
         </div>
-      {/if}
+          {/if}
+        {/if}
+      </div>
     {/if}
   </section>
 </main>
@@ -1544,6 +1575,38 @@
         transparent 28%
       ),
       linear-gradient(118deg, #111827 0%, #1f2937 58%, #4c0519 130%);
+  }
+  .masthead.compacted {
+    min-height: 72px;
+    padding: 0.7rem 1rem;
+    gap: 0.75rem;
+  }
+  .masthead.compacted .signal {
+    width: 46px;
+    height: 46px;
+  }
+  .masthead.compacted .signal span {
+    width: 15px;
+    height: 15px;
+    box-shadow: 0 0 16px #fb7185;
+  }
+  .masthead.compacted .signal i {
+    inset: 10px;
+  }
+  .masthead.compacted .signal b {
+    inset: 2px;
+  }
+  .masthead.compacted .eyebrow,
+  .masthead.compacted .refresh-action,
+  .masthead.compacted .studio-action {
+    display: none;
+  }
+  .masthead.compacted h2 {
+    font-size: 1.1rem;
+  }
+  .masthead.compacted .masthead-copy > p:last-child {
+    margin-top: 0.15rem;
+    font-size: 0.78rem;
   }
   .signal {
     position: relative;
@@ -1619,7 +1682,8 @@
   .primary,
   .secondary,
   .text-button,
-  .icon-button {
+  .icon-button,
+  .accordion-toggle {
     border-radius: 11px;
     font-weight: 750;
   }
@@ -1654,6 +1718,25 @@
     color: #e2e8f0;
     background: rgb(255 255 255 / 0.11);
     font-size: 1.25rem;
+  }
+  .accordion-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    min-height: 38px;
+    padding: 0.55rem 0.72rem;
+    color: #f8fafc;
+    background: rgb(255 255 255 / 0.11);
+    font-size: 0.76rem;
+  }
+  .accordion-toggle b {
+    display: inline-block;
+    font-size: 1.05rem;
+    line-height: 1;
+    transition: transform 160ms ease;
+  }
+  .accordion-toggle.expanded b {
+    transform: rotate(180deg);
   }
   .spin {
     display: inline-block;
@@ -2112,6 +2195,13 @@
       grid-column: 1 / -1;
       justify-content: flex-end;
     }
+    .masthead.compacted {
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      padding: 0.65rem 0.8rem;
+    }
+    .masthead.compacted .masthead-actions {
+      grid-column: auto;
+    }
     .watch-grid {
       grid-template-columns: 1fr;
     }
@@ -2158,6 +2248,14 @@
     }
     .masthead h2 {
       font-size: 1.25rem;
+    }
+    .masthead.compacted .accordion-toggle span {
+      position: absolute;
+      overflow: hidden;
+      width: 1px;
+      height: 1px;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
     }
     .setup,
     .stage {

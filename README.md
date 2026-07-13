@@ -14,6 +14,7 @@ Streaming widget extension for BudaBit communities. Moderators prepare an OBS br
 - Kind `1311` live chat across public and community relays
 - Moderator authority resolved privately by the BudaBit host
 - Multiple planned/live streams listed at once
+- Compact accordion by default with user-controlled expansion and automatic expansion when the community goes live
 
 The widget does not store private keys or RTMP stream keys. Provider credentials remain in memory and are retrieved again after a reload.
 
