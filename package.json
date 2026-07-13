@@ -1,6 +1,6 @@
 {
   "name": "budabit-community-stream",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Community live streaming widget for BudaBit",
   "type": "module",
@@ -9,7 +9,7 @@
     "build": "vite build",
     "typecheck": "svelte-check --tsconfig ./tsconfig.json",
     "check": "pnpm typecheck && pnpm build",
-    "manifest": "node $(realpath node_modules/budabit-sdk/dist/manifest/cli.js) --title 'Community Stream' --type tool --app-url ${WIDGET_APP_URL:-https://example.com/budabit-community-stream/index.html} --icon ${WIDGET_ICON_URL:-https://example.com/budabit-community-stream/icon.svg} --image ${WIDGET_IMAGE_URL:-https://example.com/budabit-community-stream/icon.svg} --identifier 'community-stream' --version '0.2.0' --changelog 'Add a compact user-controlled accordion that automatically expands when the community goes live' --permissions 'community:checkWriteCapabilities,community:queryLiveStreams,nostr:publish,nostr:sign,ui:toast,ui:resize' --slot-type 'community-home-before-quicklinks' --slot-label 'Community stream' --output 'dist/widget'",
+    "manifest": "node $(realpath node_modules/budabit-sdk/dist/manifest/cli.js) --title 'Community Stream' --type tool --app-url ${WIDGET_APP_URL:-https://example.com/budabit-community-stream/index.html} --icon ${WIDGET_ICON_URL:-https://example.com/budabit-community-stream/icon.svg} --image ${WIDGET_IMAGE_URL:-https://example.com/budabit-community-stream/icon.svg} --identifier 'community-stream' --version '0.2.1' --changelog 'Remove excess space below the collapsed accordion' --permissions 'community:checkWriteCapabilities,community:queryLiveStreams,nostr:publish,nostr:sign,ui:toast,ui:resize' --slot-type 'community-home-before-quicklinks' --slot-label 'Community stream' --output 'dist/widget'",
     "widget:build": "pnpm build && pnpm manifest",
     "widget:publish:dry-run": "pnpm widget:build && budabit-publish --event dist/widget/event.json --dry-run",
     "widget:publish:blossom": "pnpm widget:build && budabit-publish --event dist/widget/event.json --upload-first --blossom ${BLOSSOM_SERVER:-https://blossom.primal.net} --artifact dist/index.html"

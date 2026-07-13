@@ -991,8 +991,7 @@
       Math.max(
         mainElement?.scrollHeight || 0,
         mainElement?.getBoundingClientRect().height || 0,
-        document.body.scrollHeight || 0,
-        220,
+        1,
       ) + 2,
     );
   }
