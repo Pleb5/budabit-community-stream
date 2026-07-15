@@ -64,6 +64,7 @@
   ];
   const POLL_INTERVAL_MS = 10_000;
   const CHAT_LIMIT = 150;
+  const MIN_COLLAPSED_HEIGHT = 76;
 
   const pool = new SimplePool({ enableReconnect: true });
   const trustedProviders = new Set(
@@ -268,7 +269,9 @@
   function applyCommunityContext(ctx: CommunityWidgetContext | null) {
     communityContext = ctx;
     capabilities = [];
+    loadingCapabilities = false;
     streams = [];
+    loadingStreams = false;
     hasLoadedStreams = false;
     loadError = "";
     expanded = false;
@@ -338,7 +341,13 @@
       });
       if (!contextIsCurrent(expected)) return;
       if ("error" in response) {
-        if (!hasLoadedStreams) loadError = response.error;
+        if (
+          !hasLoadedStreams &&
+          response.code !== "COMMUNITY_CONTEXT_NOT_READY" &&
+          response.code !== "COMMUNITY_QUERY_TIMEOUT"
+        ) {
+          loadError = response.error;
+        }
         return;
       }
       if (!responseMatchesContext(response, expected)) return;
@@ -991,7 +1000,7 @@
       Math.max(
         mainElement?.scrollHeight || 0,
         mainElement?.getBoundingClientRect().height || 0,
-        1,
+        MIN_COLLAPSED_HEIGHT,
       ) + 2,
     );
   }
@@ -1039,7 +1048,9 @@
     const ctx = communityContext;
     if (!bridge || !ctx) return;
     const interval = window.setInterval(
-      () => void loadStreams(ctx),
+      () => {
+        if (document.visibilityState === "visible") void loadStreams(ctx);
+      },
       POLL_INTERVAL_MS,
     );
     return () => window.clearInterval(interval);
@@ -1126,6 +1137,10 @@
             {plannedStreams.length} upcoming {plannedStreams.length === 1
               ? "stream"
               : "streams"}
+          {:else if loadError}
+            Unable to check broadcasts
+          {:else if !hasLoadedStreams || loadingStreams}
+            Checking for broadcasts
           {:else}
             The community stream is offline
           {/if}
