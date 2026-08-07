@@ -62,7 +62,7 @@ The generated manifest requests:
 - `ui:toast`
 - `ui:resize`
 
-It renders in `community-home-before-quicklinks`.
+It renders in `community-home-after-quicklinks`.
 
 ## Provider Notes
 
