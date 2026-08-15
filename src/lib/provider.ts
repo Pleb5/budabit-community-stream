@@ -26,7 +26,47 @@ export type ProviderAccount = {
   endpoints: IngestEndpoint[];
   tos?: { accepted: boolean; link: string };
   details?: StreamDetails;
+  provider_pubkey?: string;
+  service_pubkey?: string;
 };
+
+export type StreamUpdateResult = StreamDetails & {
+  details?: StreamDetails;
+  provider_pubkey?: string;
+  service_pubkey?: string;
+};
+
+const validIdentifier = (value: unknown) =>
+  typeof value === "string" && value.trim() ? value.trim() : undefined;
+
+const trustedProviderHint = (
+  values: unknown[],
+  trustedProviders: ReadonlySet<string>,
+) =>
+  values.find(
+    (value): value is string =>
+      typeof value === "string" && trustedProviders.has(value.toLowerCase()),
+  )?.toLowerCase();
+
+export const getProviderPreparationBinding = (
+  account: ProviderAccount,
+  update: StreamUpdateResult,
+  trustedProviders: ReadonlySet<string>,
+) => ({
+  streamIdentifier:
+    validIdentifier(update.id) ||
+    validIdentifier(update.details?.id) ||
+    validIdentifier(account.details?.id),
+  providerPubkey: trustedProviderHint(
+    [
+      update.provider_pubkey,
+      update.service_pubkey,
+      account.provider_pubkey,
+      account.service_pubkey,
+    ],
+    trustedProviders,
+  ),
+});
 
 const bytesToBase64 = (bytes: Uint8Array) => {
   let binary = "";
@@ -57,6 +97,30 @@ export const normalizeProviderUrl = (value: string) => {
   return url.toString().replace(/\/$/, "");
 };
 
+export const getAdvertisedProviderPubkey = (
+  events: Event[],
+  baseUrl: string,
+  trustedProviders: ReadonlySet<string>,
+) =>
+  [...events]
+    .filter(
+      (event) =>
+        verifyEvent(event) && trustedProviders.has(event.pubkey.toLowerCase()),
+    )
+    .sort((left, right) => right.created_at - left.created_at)
+    .find((event) => {
+      try {
+        const metadata = JSON.parse(event.content) as Record<string, unknown>;
+        return (
+          typeof metadata.website === "string" &&
+          normalizeProviderUrl(metadata.website) === baseUrl
+        );
+      } catch {
+        return false;
+      }
+    })
+    ?.pubkey.toLowerCase();
+
 export class StreamProviderClient {
   private offsetMs = 0;
 
@@ -86,7 +150,7 @@ export class StreamProviderClient {
   }
 
   updateStream(details: StreamDetails) {
-    return this.request<Record<string, never>>("PATCH", "event", details);
+    return this.request<StreamUpdateResult>("PATCH", "event", details);
   }
 
   acceptTerms() {
@@ -127,6 +191,7 @@ export class StreamProviderClient {
     const response = await fetch(url, {
       method,
       body: bodyText,
+      signal: AbortSignal.timeout(30_000),
       headers: {
         authorization,
         ...(bodyText === undefined

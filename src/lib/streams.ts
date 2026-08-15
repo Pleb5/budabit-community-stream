@@ -4,6 +4,7 @@ import { naddrEncode } from "nostr-tools/nip19";
 export const LIVE_STREAM_KIND = 30311;
 export const LIVE_CHAT_KIND = 1311;
 export const COMMUNITY_TAG_PREFIX = "budabit-community:";
+export const ENDED_STREAM_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 
 export type StreamStatus = "planned" | "live" | "ended" | "vod";
 
@@ -124,6 +125,37 @@ export const parseStreamEvent = (
         : undefined,
     relays: Array.from(new Set(relayUrls)),
   };
+};
+
+export const retainVisibleStreams = (
+  streams: CommunityStream[],
+  now = Math.floor(Date.now() / 1000),
+  retentionSeconds = ENDED_STREAM_RETENTION_SECONDS,
+) =>
+  streams.filter((stream) => {
+    if (stream.status === "live" || stream.status === "planned") return true;
+    const endedAt =
+      stream.ends ??
+      (stream.event.created_at > 0
+        ? stream.event.created_at
+        : stream.starts || 0);
+    return endedAt >= now - retentionSeconds;
+  });
+
+export const selectLatestStreamReplacements = (streams: CommunityStream[]) => {
+  const latestByAddress = new Map<string, CommunityStream>();
+  for (const stream of streams) {
+    const current = latestByAddress.get(stream.address);
+    if (
+      !current ||
+      stream.event.created_at > current.event.created_at ||
+      (stream.event.created_at === current.event.created_at &&
+        stream.event.id.localeCompare(current.event.id) < 0)
+    ) {
+      latestByAddress.set(stream.address, stream);
+    }
+  }
+  return Array.from(latestByAddress.values());
 };
 
 export const streamNaddr = (stream: CommunityStream, relays: string[]) =>

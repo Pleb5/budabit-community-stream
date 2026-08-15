@@ -7,9 +7,8 @@
     type NostrPublishResponse,
     type NostrSignResponse,
     type WidgetBridge,
-    type WidgetInitPayload,
   } from "budabit-sdk";
-  import { SimplePool, type SubCloser } from "nostr-tools/pool";
+  import { SimplePool } from "nostr-tools/pool";
   import {
     verifyEvent,
     type Event,
@@ -21,17 +20,34 @@
     LIVE_CHAT_KIND,
     LIVE_STREAM_KIND,
     getStreamAddress,
-    hasCommunityTag,
     parseStreamEvent,
+    retainVisibleStreams,
+    selectLatestStreamReplacements,
     streamNaddr,
     type CommunityStream,
   } from "./lib/streams";
   import {
     normalizeProviderUrl,
     StreamProviderClient,
+    getAdvertisedProviderPubkey,
+    getProviderPreparationBinding,
     type IngestEndpoint,
     type ProviderAccount,
   } from "./lib/provider";
+  import {
+    canConnectProvider as providerConnectAllowed,
+    classifyCommunityError,
+    getCapabilityFailurePolicy,
+    getChatPollSince,
+    getContextTransitionPolicy,
+    getHostCapabilityCatalog,
+    getHostCapabilityPolicy,
+    getNextPreparedMirrorEvent,
+    getPollDelay,
+    isPreparedMirrorEligible,
+    type LoadOutcome,
+    type PreparedMirrorSession,
+  } from "./lib/compatibility";
 
   type WidgetTheme = "light" | "dark";
   type ContextResponse = { contextSessionId?: string; contextVersion?: number };
@@ -62,15 +78,20 @@
     "f6a25b87f7e7bec9a691e37851b1b57a7b49fa00bb431280303002a3ebca4891",
     "85df822a86599ffbe8143db1e1e1bf2d162fa60fc685c65515963e67cfd7499f",
   ];
-  const POLL_INTERVAL_MS = 10_000;
+  const CHAT_POLL_INTERVAL_MS = 5_000;
+  const LAUNCH_POLL_INTERVAL_MS = 7_500;
+  const PREPARED_SESSION_SECONDS = 6 * 60 * 60;
+  const PROFILE_REFRESH_TTL_MS = 5 * 60 * 1_000;
+  const PROVIDER_ADVERTISEMENT_KIND = 31_990;
   const CHAT_LIMIT = 150;
   const MIN_COLLAPSED_HEIGHT = 76;
 
-  const pool = new SimplePool({ enableReconnect: true });
+  const pool = new SimplePool({ enableReconnect: false });
   const trustedProviders = new Set(
-    parseCsv(import.meta.env.VITE_TRUSTED_STREAM_PROVIDER_PUBKEYS).length
+    (parseCsv(import.meta.env.VITE_TRUSTED_STREAM_PROVIDER_PUBKEYS).length
       ? parseCsv(import.meta.env.VITE_TRUSTED_STREAM_PROVIDER_PUBKEYS)
-      : DEFAULT_TRUSTED_PROVIDERS,
+      : DEFAULT_TRUSTED_PROVIDERS
+    ).map((pubkey) => pubkey.toLowerCase()),
   );
   const configuredPublicRelays = normalizeRelays(
     parseCsv(import.meta.env.VITE_PUBLIC_STREAM_RELAYS).length
@@ -79,11 +100,13 @@
   );
 
   let bridge = $state<WidgetBridge | null>(null);
-  let initPayload = $state<WidgetInitPayload | null>(null);
+  let hostCapabilityCatalog = $state<string[] | null>(null);
   let communityContext = $state<CommunityWidgetContext | null>(null);
   let capabilities = $state<CommunityWriteCapability[]>([]);
   let streams = $state<CommunityStream[]>([]);
   let loadingCapabilities = $state(false);
+  let hasLoadedCapabilities = $state(false);
+  let capabilityError = $state("");
   let loadingStreams = $state(false);
   let hasLoadedStreams = $state(false);
   let loadError = $state("");
@@ -98,6 +121,7 @@
   let providerUrl = $state(DEFAULT_PROVIDER_URL);
   let providerClient = $state<StreamProviderClient | null>(null);
   let providerAccount = $state<ProviderAccount | null>(null);
+  let providerPubkey = $state("");
   let providerLoading = $state(false);
   let providerError = $state("");
   let termsAccepted = $state(false);
@@ -118,20 +142,48 @@
   let chatSending = $state(false);
   let chatError = $state("");
   let messagesElement = $state<HTMLDivElement | null>(null);
-  let chatSubscription: SubCloser | null = null;
   let chatSession = 0;
+  let chatPollTimer: number | undefined;
+  let chatFetchSession = 0;
   const requestedChatProfiles = new Set<string>();
-  let launchSubscription: SubCloser | null = null;
-  const streamSubscriptions = new Map<string, SubCloser>();
+  const chatProfileFetchedAt = new Map<string, number>();
+  const poolRelayScopes = new Map<string, Set<string>>();
+  let launchMonitorSession = 0;
+  let launchPollTimer: number | undefined;
+  let launchFetchSession = 0;
+  let preparedMirrorSession = $state<PreparedMirrorSession | null>(null);
   const mirrorPromises = new Map<string, Promise<void>>();
+  const mirroredEventIds = new Set<string>();
+  let setupSession = 0;
+  let streamPollSession = 0;
+  let streamPollTimer: number | undefined;
+  let streamReloadRequested = false;
+  let capabilityPollSession = 0;
+  let capabilityPollTimer: number | undefined;
 
   const descriptors = $derived.by(() =>
     getCommunityDescriptors(communityContext),
   );
+  const hostCapabilityPolicy = $derived(
+    getHostCapabilityPolicy(hostCapabilityCatalog),
+  );
+  const hasNostrControls = $derived(
+    hostCapabilityPolicy["nostr:sign"] &&
+      hostCapabilityPolicy["nostr:publish"],
+  );
   const canModerate = $derived(
-    Boolean(
-      communityContext?.viewer.isOwner ||
-      capabilities.some((capability) => capability.canModerate),
+    hostCapabilityPolicy["community:checkWriteCapabilities"] &&
+      hasLoadedCapabilities &&
+      Boolean(
+        communityContext?.viewer.isOwner ||
+        capabilities.some((capability) => capability.canModerate),
+      ),
+  );
+  const canConnectProvider = $derived(
+    providerConnectAllowed(
+      canModerate,
+      communityContext?.viewer.pubkey,
+      hostCapabilityPolicy,
     ),
   );
   const liveStreams = $derived(
@@ -191,6 +243,33 @@
     return Array.from(new Set(relays));
   }
 
+  function updatePoolRelayScope(scope: string, values: string[]) {
+    const relays = normalizeRelays(values);
+    const previous = poolRelayScopes.get(scope) || new Set<string>();
+    if (relays.length) poolRelayScopes.set(scope, new Set(relays));
+    else poolRelayScopes.delete(scope);
+    const active = new Set(
+      Array.from(poolRelayScopes.values()).flatMap((items) => [...items]),
+    );
+    const obsolete = [...previous].filter((relay) => !active.has(relay));
+    if (obsolete.length) pool.close(obsolete);
+    pool.pruneIdleRelays(30_000);
+    return relays;
+  }
+
+  function clearPoolRelayScope(scope: string) {
+    updatePoolRelayScope(scope, []);
+  }
+
+  function sameRelaySet(left: string[], right: string[]) {
+    const leftSet = new Set(normalizeRelays(left));
+    const rightSet = new Set(normalizeRelays(right));
+    return (
+      leftSet.size === rightSet.size &&
+      [...leftSet].every((relay) => rightSet.has(relay))
+    );
+  }
+
   function descriptorKey(descriptor: CommunityEventDescriptor) {
     return `${descriptor.kind}:${descriptor.subtype || ""}`;
   }
@@ -217,7 +296,20 @@
   }
 
   function getContextKey(ctx: CommunityWidgetContext | null) {
-    return ctx ? `${ctx.contextSessionId}:${ctx.contextVersion}` : "";
+    return ctx
+      ? [
+          ctx.contextSessionId,
+          ctx.contextVersion,
+          ctx.pubkey,
+          ctx.viewer.pubkey || "",
+          ctx.viewer.isOwner ? "owner" : "member",
+          ctx.viewer.isBanned ? "banned" : "active",
+          getCommunityDescriptors(ctx)
+            .map(descriptorKey)
+            .sort()
+            .join("|"),
+        ].join(":")
+      : "";
   }
 
   function contextIsCurrent(expected: CommunityWidgetContext) {
@@ -249,9 +341,16 @@
   }
 
   function resetSetup(ctx: CommunityWidgetContext | null) {
+    setupSession += 1;
+    closeLaunchMonitor();
+    clearPoolRelayScope("provider-identity");
+    preparedMirrorSession = null;
+    mirrorPromises.clear();
+    mirroredEventIds.clear();
     providerUrl = DEFAULT_PROVIDER_URL;
     providerClient = null;
     providerAccount = null;
+    providerPubkey = "";
     providerError = "";
     providerLoading = false;
     termsAccepted = false;
@@ -266,21 +365,47 @@
     launchStatus = "";
   }
 
-  function applyCommunityContext(ctx: CommunityWidgetContext | null) {
-    communityContext = ctx;
+  function revokeModeratorAuthority(ctx = communityContext) {
     capabilities = [];
-    loadingCapabilities = false;
-    streams = [];
-    loadingStreams = false;
-    hasLoadedStreams = false;
-    loadError = "";
-    expanded = false;
-    joinedAddress = "";
+    hasLoadedCapabilities = false;
     setupOpen = false;
-    closeStreamSubscriptions();
-    closeLaunchSubscription();
-    stopChat();
     resetSetup(ctx);
+  }
+
+  function applyCommunityContext(ctx: CommunityWidgetContext | null) {
+    const previous = communityContext;
+    const transition = getContextTransitionPolicy(previous, ctx);
+    const selectedBeforeChange = streams.find(
+      (stream) => stream.address === joinedAddress,
+    );
+    communityContext = ctx;
+    loadingCapabilities = false;
+    loadingStreams = false;
+    streamReloadRequested = false;
+    loadError = "";
+    capabilityError = "";
+
+    if (!transition.retainCapabilities) {
+      capabilities = [];
+      hasLoadedCapabilities = false;
+    }
+    if (
+      !transition.retainStreams ||
+      !getCommunityDescriptors(ctx).length
+    ) {
+      streams = [];
+      hasLoadedStreams = false;
+      expanded = false;
+      joinedAddress = "";
+      stopChat();
+    } else if (selectedBeforeChange) {
+      invalidateChatProfileRefresh();
+      void startChat(selectedBeforeChange);
+    }
+    if (!transition.retainProviderSession) {
+      setupOpen = false;
+      resetSetup(ctx);
+    }
     lastRequestedHeight = 0;
     scheduleHostResize();
   }
@@ -296,10 +421,19 @@
     }
   }
 
-  async function refreshCapabilities(ctx = communityContext) {
-    if (!bridge || !ctx || loadingCapabilities) return;
+  async function refreshCapabilities(
+    ctx = communityContext,
+  ): Promise<LoadOutcome> {
+    if (!bridge || !ctx) return "unavailable";
+    if (loadingCapabilities) return "skipped";
+    if (!hostCapabilityPolicy["community:checkWriteCapabilities"]) {
+      revokeModeratorAuthority(ctx);
+      capabilityError =
+        "This BudaBit host does not support moderator capability checks for the stream studio.";
+      return "unavailable";
+    }
     const requestedDescriptors = getCommunityDescriptors(ctx);
-    if (!requestedDescriptors.length) return;
+    if (!requestedDescriptors.length) return "unavailable";
     const expected = ctx;
     loadingCapabilities = true;
     try {
@@ -309,60 +443,100 @@
           descriptors: requestedDescriptors,
         },
       );
-      if (
-        !contextIsCurrent(expected) ||
-        "error" in response ||
-        !responseMatchesContext(response, expected)
-      )
-        return;
+      if (!contextIsCurrent(expected)) return "skipped";
+      if ("error" in response) {
+        const failure = getCapabilityFailurePolicy(response);
+        if (!failure.retainAuthority) {
+          revokeModeratorAuthority(expected);
+          capabilityError = response.error;
+        }
+        return failure.outcome;
+      }
+      if (!responseMatchesContext(response, expected)) return "skipped";
       capabilities = response.capabilities;
-    } catch {
-      if (contextIsCurrent(expected)) capabilities = [];
+      hasLoadedCapabilities = true;
+      capabilityError = "";
+      if (
+        !expected.viewer.isOwner &&
+        !response.capabilities.some((capability) => capability.canModerate)
+      ) {
+        setupOpen = false;
+        resetSetup(expected);
+      }
+      return "success";
+    } catch (error) {
+      if (!contextIsCurrent(expected)) return "skipped";
+      const failure = getCapabilityFailurePolicy(error);
+      if (!failure.retainAuthority) {
+        revokeModeratorAuthority(expected);
+        capabilityError = error instanceof Error ? error.message : String(error);
+      }
+      return failure.outcome;
     } finally {
       if (contextIsCurrent(expected)) loadingCapabilities = false;
     }
   }
 
-  async function loadStreams(ctx = communityContext) {
-    if (!bridge || !ctx || loadingStreams) return;
+  async function loadStreams(
+    ctx = communityContext,
+  ): Promise<LoadOutcome> {
+    if (!bridge || !ctx) return "unavailable";
+    if (loadingStreams) {
+      streamReloadRequested = true;
+      return "skipped";
+    }
+    if (!hostCapabilityPolicy["community:queryLiveStreams"]) {
+      loadError =
+        "This BudaBit host does not support community stream discovery.";
+      return "unavailable";
+    }
     const requestedDescriptors = getCommunityDescriptors(ctx);
     if (!requestedDescriptors.length) {
       loadError =
         "This community has no sections that can authorize stream moderators.";
-      return;
+      hasLoadedStreams = false;
+      loadingStreams = false;
+      return "unavailable";
     }
     const expected = ctx;
     loadingStreams = true;
     try {
       const response = await bridge.request("community:queryLiveStreams", {
         descriptors: requestedDescriptors,
-        limit: 100,
-        since: Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60,
+        limit: 500,
       });
-      if (!contextIsCurrent(expected)) return;
+      if (!contextIsCurrent(expected)) return "skipped";
       if ("error" in response) {
-        if (
-          !hasLoadedStreams &&
-          response.code !== "COMMUNITY_CONTEXT_NOT_READY" &&
-          response.code !== "COMMUNITY_QUERY_TIMEOUT"
-        ) {
-          loadError = response.error;
-        }
-        return;
+        const classification = classifyCommunityError(response);
+        if (classification === "terminal") loadError = response.error;
+        return classification;
       }
-      if (!responseMatchesContext(response, expected)) return;
+      if (!responseMatchesContext(response, expected)) return "skipped";
       const wasLoaded = hasLoadedStreams;
       const wasLive = streams.some((stream) => stream.status === "live");
-      const nextStreams = response.events
-        .filter((event): event is Event => verifyEvent(event as Event))
-        .map((event) => parseStreamEvent(event, trustedProviders))
-        .filter((stream): stream is CommunityStream => Boolean(stream))
-        .sort(compareStreams);
+      const currentJoinedStream = streams.find(
+        (stream) => stream.address === joinedAddress,
+      );
+      const nextStreams = retainVisibleStreams(
+        selectLatestStreamReplacements(
+          response.events
+            .filter((event): event is Event => verifyEvent(event as Event))
+            .map((event) => parseStreamEvent(event, trustedProviders))
+            .filter((stream): stream is CommunityStream => Boolean(stream)),
+        ),
+      ).sort(compareStreams);
+      const nextJoinedStream = nextStreams.find(
+        (stream) => stream.address === joinedAddress,
+      );
+      const joinedRelaysChanged = Boolean(
+        currentJoinedStream &&
+          nextJoinedStream &&
+          !sameRelaySet(currentJoinedStream.relays, nextJoinedStream.relays),
+      );
       loadError = "";
       hasLoadedStreams = true;
       if (!sameStreams(streams, nextStreams)) {
         streams = nextStreams;
-        syncStreamSubscriptions(nextStreams);
       }
       if (
         nextStreams.some((stream) => stream.status === "live") &&
@@ -370,19 +544,31 @@
       ) {
         expanded = true;
       }
-      if (
-        joinedAddress &&
-        !nextStreams.some((stream) => stream.address === joinedAddress)
-      ) {
+      if (joinedAddress && !nextJoinedStream) {
         joinedAddress = "";
         stopChat();
+      } else if (joinedRelaysChanged && nextJoinedStream) {
+        invalidateChatProfileRefresh();
+        startChat(nextJoinedStream);
       }
+      return "success";
     } catch (error) {
-      if (contextIsCurrent(expected) && !hasLoadedStreams) {
+      if (!contextIsCurrent(expected)) return "skipped";
+      const classification = classifyCommunityError(error);
+      if (classification === "terminal") {
         loadError = error instanceof Error ? error.message : String(error);
       }
+      return classification;
     } finally {
-      if (contextIsCurrent(expected)) loadingStreams = false;
+      if (contextIsCurrent(expected)) {
+        loadingStreams = false;
+        if (streamReloadRequested) {
+          streamReloadRequested = false;
+          queueMicrotask(() => {
+            if (contextIsCurrent(expected)) void loadStreams(expected);
+          });
+        }
+      }
       scheduleHostResize();
     }
   }
@@ -422,7 +608,9 @@
   }
 
   async function connectProvider() {
-    if (!bridge || !communityContext || !canModerate || providerLoading) return;
+    if (!bridge || !communityContext || !canConnectProvider || providerLoading)
+      return;
+    const session = setupSession;
     providerLoading = true;
     providerError = "";
     prepared = false;
@@ -432,8 +620,15 @@
       const client = new StreamProviderClient(bridge, normalized);
       await client.syncClock();
       const account = await client.account();
+      if (session !== setupSession || !canConnectProvider) return;
+      const resolvedProviderPubkey = await resolveProviderPubkey(
+        normalized,
+        account,
+      );
+      if (session !== setupSession || !canConnectProvider) return;
       providerClient = client;
       providerAccount = account;
+      providerPubkey = resolvedProviderPubkey;
       termsAccepted = account.tos?.accepted !== false;
       selectedEndpointName =
         account.endpoints.find((endpoint) => endpoint.name === "Best")?.name ||
@@ -445,27 +640,33 @@
       if (!account.endpoints.length)
         throw new Error("This provider did not return an OBS ingest endpoint.");
     } catch (error) {
+      if (session !== setupSession) return;
       providerClient = null;
       providerAccount = null;
       providerError = error instanceof Error ? error.message : String(error);
     } finally {
-      providerLoading = false;
-      scheduleHostResize();
+      if (session === setupSession) {
+        providerLoading = false;
+        scheduleHostResize();
+      }
     }
   }
 
   async function acceptProviderTerms() {
-    if (!providerClient || providerLoading) return;
+    if (!providerClient || !canConnectProvider || providerLoading) return;
+    const session = setupSession;
     providerLoading = true;
     providerError = "";
     try {
       await providerClient.acceptTerms();
+      if (session !== setupSession) return;
       termsAccepted = true;
       if (providerAccount?.tos) providerAccount.tos.accepted = true;
     } catch (error) {
+      if (session !== setupSession) return;
       providerError = error instanceof Error ? error.message : String(error);
     } finally {
-      providerLoading = false;
+      if (session === setupSession) providerLoading = false;
     }
   }
 
@@ -473,11 +674,17 @@
     if (
       !providerClient ||
       !providerAccount ||
+      !providerPubkey ||
       !communityContext ||
+      !canConnectProvider ||
       preparing ||
       !selectedEndpoint
     )
       return;
+    const expectedContext = communityContext;
+    const session = setupSession;
+    const client = providerClient;
+    const account = providerAccount;
     if (!termsAccepted) {
       providerError = "Accept the provider terms before preparing the stream.";
       return;
@@ -494,30 +701,72 @@
     providerError = "";
     launchStatus = "Saving stream metadata...";
     try {
+      const preparedAt = Math.floor(Date.now() / 1000);
+      const preparationTag = createPreparationTag();
       const communityTag = `${COMMUNITY_TAG_PREFIX}${communityContext.pubkey.toLowerCase()}`;
       const tags = Array.from(
         new Set([
           communityTag,
-          ...parseCsv(streamTags).filter((tag) => tag !== communityTag),
+          preparationTag,
+          ...parseCsv(streamTags).filter(
+            (tag) =>
+              tag !== communityTag &&
+              !tag.startsWith("budabit-stream-session:"),
+          ),
         ]),
       );
-      await providerClient.updateStream({
+      const updateResult = await client.updateStream({
+        id: account.details?.id,
         title: streamTitle.trim(),
         summary: streamSummary.trim() || undefined,
         image: normalizeOptionalHttpsUrl(streamImage),
         tags,
       });
+      if (
+        session !== setupSession ||
+        !communityContext ||
+        communityContext.pubkey !== expectedContext.pubkey ||
+        communityContext.viewer.pubkey !== expectedContext.viewer.pubkey ||
+        communityContext.contextSessionId !== expectedContext.contextSessionId ||
+        !canConnectProvider
+      ) {
+        return;
+      }
+      const binding = getProviderPreparationBinding(
+        account,
+        updateResult,
+        trustedProviders,
+      );
+      if (binding.providerPubkey && binding.providerPubkey !== providerPubkey) {
+        throw new Error(
+          "The provider returned a signer that does not match its trusted advertisement.",
+        );
+      }
+      preparedMirrorSession = {
+        communityPubkey: communityContext.pubkey,
+        viewerPubkey: communityContext.viewer.pubkey!,
+        contextSessionId: communityContext.contextSessionId,
+        preparedAt,
+        expiresAt: preparedAt + PREPARED_SESSION_SECONDS,
+        sessionTag: preparationTag,
+        providerBaseUrl: client.baseUrl,
+        streamIdentifier: binding.streamIdentifier,
+        providerPubkey,
+      };
       prepared = true;
       launchStatus =
         "OBS is ready. Start streaming to publish the community event.";
-      await startLaunchMonitor(communityContext);
+      startLaunchMonitor();
       await showToast("Stream prepared. Start streaming from OBS.", "success");
     } catch (error) {
+      if (session !== setupSession) return;
       providerError = error instanceof Error ? error.message : String(error);
       launchStatus = "";
     } finally {
-      preparing = false;
-      scheduleHostResize();
+      if (session === setupSession) {
+        preparing = false;
+        scheduleHostResize();
+      }
     }
   }
 
@@ -530,6 +779,62 @@
     return url.toString();
   }
 
+  function createPreparationTag() {
+    const id =
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+            byte.toString(16).padStart(2, "0"),
+          ).join("");
+    return `budabit-stream-session:${id}`;
+  }
+
+  async function resolveProviderPubkey(
+    baseUrl: string,
+    account: ProviderAccount,
+  ) {
+    const hint = getProviderPreparationBinding(
+      account,
+      {},
+      trustedProviders,
+    ).providerPubkey;
+    if (hint) return hint;
+
+    const relays = updatePoolRelayScope("provider-identity", [
+      ...configuredPublicRelays,
+      ...(communityContext?.relays || []),
+    ]);
+    if (!relays.length) {
+      throw new Error("No valid relays are available to verify the provider.");
+    }
+    let events: Event[];
+    try {
+      events = await pool.querySync(
+        relays,
+        {
+          kinds: [PROVIDER_ADVERTISEMENT_KIND],
+          authors: Array.from(trustedProviders),
+          "#k": [String(LIVE_STREAM_KIND)],
+          limit: Math.max(20, trustedProviders.size * 4),
+        },
+        { maxWait: 4_000 },
+      );
+    } finally {
+      clearPoolRelayScope("provider-identity");
+    }
+    const advertisedPubkey = getAdvertisedProviderPubkey(
+      events,
+      baseUrl,
+      trustedProviders,
+    );
+    if (!advertisedPubkey) {
+      throw new Error(
+        "The selected provider did not advertise a trusted Nostr signer for this API URL.",
+      );
+    }
+    return advertisedPubkey;
+  }
+
   async function copyValue(value: string, label: string) {
     try {
       await navigator.clipboard.writeText(value);
@@ -539,139 +844,189 @@
     }
   }
 
-  function isHostedBy(event: Event, pubkey: string) {
-    return event.tags.some(
-      (tag) =>
-        tag[0] === "p" && tag[1] === pubkey && tag[3]?.toLowerCase() === "host",
-    );
+  function currentMirrorContext() {
+    return {
+      communityPubkey: communityContext?.pubkey || "",
+      viewerPubkey: communityContext?.viewer.pubkey,
+      contextSessionId: communityContext?.contextSessionId || "",
+      canModerate,
+    };
   }
 
-  async function startLaunchMonitor(ctx: CommunityWidgetContext) {
-    closeLaunchSubscription();
-    const viewerPubkey = ctx.viewer.pubkey;
-    if (!viewerPubkey) return;
+  function startLaunchMonitor() {
+    closeLaunchMonitor();
+    const session = launchMonitorSession;
+    void pollLaunchMonitor(session);
+  }
+
+  async function pollLaunchMonitor(session: number) {
+    if (
+      session !== launchMonitorSession ||
+      launchFetchSession === session ||
+      !preparedMirrorSession ||
+      !communityContext
+    )
+      return;
+    const preparedSession = preparedMirrorSession;
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      now > preparedSession.expiresAt ||
+      preparedSession.communityPubkey !== communityContext.pubkey ||
+      preparedSession.viewerPubkey !== communityContext.viewer.pubkey ||
+      preparedSession.contextSessionId !== communityContext.contextSessionId ||
+      !canModerate
+    ) {
+      launchStatus = "Provider stream detection expired. Prepare the stream again.";
+      closeLaunchMonitor();
+      preparedMirrorSession = null;
+      return;
+    }
+
+    launchFetchSession = session;
     const filter = {
       kinds: [LIVE_STREAM_KIND],
-      authors: Array.from(trustedProviders),
-      "#p": [viewerPubkey],
-      "#t": [`${COMMUNITY_TAG_PREFIX}${ctx.pubkey.toLowerCase()}`],
-      since: Math.floor(Date.now() / 1000) - 300,
+      authors: [preparedSession.providerPubkey],
+      "#p": [preparedSession.viewerPubkey],
+      "#t": [preparedSession.sessionTag],
+      ...(preparedSession.streamIdentifier
+        ? { "#d": [preparedSession.streamIdentifier] }
+        : {}),
+      since: preparedSession.preparedAt - 60,
+      limit: preparedSession.streamAddress ? 10 : 20,
     };
-    const handle = (event: Event) => {
-      if (!verifyEvent(event) || !trustedProviders.has(event.pubkey)) return;
-      if (
-        !isHostedBy(event, viewerPubkey) ||
-        !hasCommunityTag(event, ctx.pubkey)
-      )
-        return;
+    try {
+      const relays = updatePoolRelayScope("launch", [
+        ...configuredPublicRelays,
+        ...selectedPublicRelays,
+        ...communityContext.relays,
+      ]);
+      if (!relays.length) {
+        throw new Error("no valid relays are available for provider detection");
+      }
+      const events = await pool.querySync(
+        relays,
+        filter,
+        { maxWait: 5_000 },
+      );
+      if (session !== launchMonitorSession || !preparedMirrorSession) return;
+      const replacement = getNextPreparedMirrorEvent(
+        events.filter((event) => verifyEvent(event)),
+        preparedMirrorSession,
+        currentMirrorContext(),
+        trustedProviders,
+        mirroredEventIds,
+      );
+      if (!replacement) return;
+
+      if (!preparedMirrorSession.streamAddress) {
+        preparedMirrorSession = {
+          ...preparedMirrorSession,
+          streamIdentifier:
+            preparedMirrorSession.streamIdentifier ||
+            getStreamAddress(replacement).split(":").slice(2).join(":"),
+          streamAddress: getStreamAddress(replacement),
+          providerPubkey: replacement.pubkey,
+        };
+      }
       launchStatus =
-        "Provider stream detected. Publishing it to the community relays...";
-      void mirrorEvent(event, ctx)
-        .then(() => {
-          launchStatus = "The community stream is live.";
-          void loadStreams(ctx);
-        })
-        .catch((error) => {
-          launchStatus = `Unable to publish the stream to the community relays: ${error instanceof Error ? error.message : String(error)}`;
-        });
-    };
-    void pool
-      .querySync(configuredPublicRelays, filter, { maxWait: 3000 })
-      .then((events) => events.forEach(handle));
-    launchSubscription = pool.subscribeMany(configuredPublicRelays, filter, {
-      onevent: handle,
-    });
+        "Provider stream detected. Publishing its latest replacement to the community relays...";
+      try {
+        await mirrorEvent(replacement, preparedMirrorSession);
+        if (session !== launchMonitorSession) return;
+        launchStatus = "The latest community stream update is published.";
+        void loadStreams(communityContext);
+      } catch (error) {
+        if (session === launchMonitorSession) {
+          launchStatus = `Unable to publish the provider replacement: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+    } catch (error) {
+      if (session === launchMonitorSession) {
+        launchStatus = `Provider detection will retry: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    } finally {
+      if (launchFetchSession === session) launchFetchSession = 0;
+      if (session === launchMonitorSession && preparedMirrorSession) {
+        launchPollTimer = window.setTimeout(
+          () => void pollLaunchMonitor(session),
+          LAUNCH_POLL_INTERVAL_MS,
+        );
+      }
+    }
   }
 
-  async function mirrorEvent(event: Event, ctx = communityContext) {
-    if (!bridge || !ctx || !verifyEvent(event)) return;
-    if (!hasCommunityTag(event, ctx.pubkey)) return;
+  async function mirrorEvent(event: Event, session: PreparedMirrorSession) {
+    const ctx = communityContext;
+    if (!bridge || !ctx || !verifyEvent(event)) {
+      throw new Error("the provider replacement is invalid");
+    }
+    if (!hasNostrControls) {
+      throw new Error("the host does not expose Nostr signing and publishing");
+    }
+    if (
+      !isPreparedMirrorEligible(
+        event,
+        session,
+        currentMirrorContext(),
+        trustedProviders,
+      )
+    ) {
+      throw new Error("the replacement is outside the active prepared session");
+    }
+    if (mirroredEventIds.has(event.id)) return;
     const existing = mirrorPromises.get(event.id);
     if (existing) return existing;
 
     const communityRelays = new Set(normalizeRelays(ctx.relays));
+    const relays = normalizeRelays([...ctx.relays, ...selectedPublicRelays]);
+    if (!relays.length) {
+      throw new Error("no valid relays are available for the provider replacement");
+    }
     const promise = bridge
       .request("nostr:publish", {
         event,
-        relays: normalizeRelays([...ctx.relays, ...selectedPublicRelays]),
+        relays,
       })
       .then((rawResponse) => {
         const response = rawResponse as NostrPublishResponse;
         if ("error" in response) throw new Error(response.error);
 
         const result = response.result as PublishResult | undefined;
+        if (result?.successCount === 0) {
+          throw new Error("no relay accepted the event");
+        }
         const acceptedByCommunity = result?.publishResult?.some(
           ({ relay, status }) =>
             status === "fulfilled" &&
             communityRelays.has(normalizeRelays([relay])[0] || ""),
         );
         if (communityRelays.size > 0 && !acceptedByCommunity) {
-          throw new Error("no community relay accepted the event");
+          const rejection = result?.publishResult?.find(
+            ({ relay, status }) =>
+              status === "rejected" &&
+              communityRelays.has(normalizeRelays([relay])[0] || ""),
+          );
+          throw new Error(
+            rejection?.reason || "no community relay accepted the event",
+          );
         }
       });
     mirrorPromises.set(event.id, promise);
 
     try {
       await promise;
-    } catch (error) {
+      mirroredEventIds.add(event.id);
+    } finally {
       mirrorPromises.delete(event.id);
-      throw error;
     }
   }
 
-  function syncStreamSubscriptions(nextStreams: CommunityStream[]) {
-    const activeAddresses = new Set(
-      nextStreams
-        .filter(
-          (stream) => stream.status === "live" || stream.status === "planned",
-        )
-        .map((stream) => stream.address),
-    );
-    for (const [address, subscription] of streamSubscriptions) {
-      if (!activeAddresses.has(address)) {
-        subscription.close();
-        streamSubscriptions.delete(address);
-      }
-    }
-    for (const stream of nextStreams) {
-      if (
-        !activeAddresses.has(stream.address) ||
-        streamSubscriptions.has(stream.address)
-      )
-        continue;
-      const filter = {
-        kinds: [LIVE_STREAM_KIND],
-        authors: [stream.event.pubkey],
-        "#d": [stream.identifier],
-        since: stream.event.created_at,
-      };
-      const subscription = pool.subscribeMany(
-        normalizeRelays([...configuredPublicRelays, ...stream.relays]),
-        filter,
-        {
-          onevent: (event) => {
-            if (
-              !verifyEvent(event) ||
-              !hasCommunityTag(event, communityContext?.pubkey || "")
-            )
-              return;
-            void mirrorEvent(event).then(() => void loadStreams());
-          },
-        },
-      );
-      streamSubscriptions.set(stream.address, subscription);
-    }
-  }
-
-  function closeStreamSubscriptions() {
-    for (const subscription of streamSubscriptions.values())
-      subscription.close();
-    streamSubscriptions.clear();
-  }
-
-  function closeLaunchSubscription() {
-    launchSubscription?.close();
-    launchSubscription = null;
+  function closeLaunchMonitor() {
+    launchMonitorSession += 1;
+    if (launchPollTimer !== undefined) window.clearTimeout(launchPollTimer);
+    launchPollTimer = undefined;
+    launchFetchSession = 0;
+    clearPoolRelayScope("launch");
   }
 
   function joinStream(stream: CommunityStream) {
@@ -698,31 +1053,57 @@
   function profileRelaysFor(stream: CommunityStream) {
     return normalizeRelays([
       ...configuredPublicRelays,
-      ...(initPayload?.relays || []),
+      ...(communityContext?.relays || []),
       ...stream.relays,
     ]);
   }
 
-  async function startChat(stream: CommunityStream) {
+  function startChat(stream: CommunityStream) {
     stopChat();
-    const session = ++chatSession;
-    const relays = chatRelaysFor(stream);
+    const session = chatSession;
     chatLoading = true;
     chatError = "";
+    void pollChat(stream, session, true);
+  }
+
+  async function pollChat(
+    stream: CommunityStream,
+    session: number,
+    initial = false,
+  ) {
+    if (session !== chatSession || chatFetchSession === session) return;
+    chatFetchSession = session;
+    const since = getChatPollSince(
+      chatMessages.filter((message) => message.delivery !== "sending"),
+    );
     const filter = {
       kinds: [LIVE_CHAT_KIND],
       "#a": [stream.address],
-      limit: CHAT_LIMIT,
+      ...(initial || since === undefined
+        ? { limit: CHAT_LIMIT }
+        : { since, limit: CHAT_LIMIT }),
     };
     try {
-      const existing = await pool.querySync(relays, filter, { maxWait: 4000 });
+      const relays = updatePoolRelayScope("chat", chatRelaysFor(stream));
+      if (!relays.length) {
+        throw new Error("No valid relays are available for live chat");
+      }
+      const existing = await pool.querySync(relays, filter, {
+        maxWait: 4_000,
+      });
       if (session !== chatSession) return;
-      chatMessages = existing.filter(
+      const next = existing.filter(
         (event) =>
           verifyEvent(event) && referencesStream(event, stream.address),
       );
+      const byId = new Map(
+        chatMessages.map((message) => [message.id, message] as const),
+      );
+      next.forEach((event) => byId.set(event.id, event));
+      chatMessages = Array.from(byId.values());
       sortChatMessages();
       scrollChatToBottom();
+      chatError = "";
       void loadChatProfiles(
         [
           ...chatMessages.map((message) => message.pubkey),
@@ -731,20 +1112,18 @@
         profileRelaysFor(stream),
         session,
       );
-      chatSubscription = pool.subscribeMany(
-        relays,
-        {
-          kinds: [LIVE_CHAT_KIND],
-          "#a": [stream.address],
-          since: Math.floor(Date.now() / 1000) - 5,
-        },
-        { onevent: (event) => addChatMessage(event, stream.address) },
-      );
     } catch (error) {
       if (session === chatSession)
         chatError = error instanceof Error ? error.message : String(error);
     } finally {
-      if (session === chatSession) chatLoading = false;
+      if (chatFetchSession === session) chatFetchSession = 0;
+      if (session === chatSession) {
+        chatLoading = false;
+        chatPollTimer = window.setTimeout(
+          () => void pollChat(stream, session),
+          CHAT_POLL_INTERVAL_MS,
+        );
+      }
     }
   }
 
@@ -753,21 +1132,6 @@
       event.kind === LIVE_CHAT_KIND &&
       event.tags.some((tag) => tag[0] === "a" && tag[1] === address)
     );
-  }
-
-  function addChatMessage(event: Event, address: string) {
-    if (!verifyEvent(event) || !referencesStream(event, address)) return;
-    if (chatMessages.some((message) => message.id === event.id)) return;
-    chatMessages = [...chatMessages, event];
-    sortChatMessages();
-    scrollChatToBottom();
-    if (selectedStream) {
-      void loadChatProfiles(
-        [event.pubkey],
-        profileRelaysFor(selectedStream),
-        chatSession,
-      );
-    }
   }
 
   function sortChatMessages() {
@@ -784,22 +1148,24 @@
     relays: string[],
     session: number,
   ) {
+    const now = Date.now();
     const pending = Array.from(new Set(pubkeys.filter(Boolean))).filter(
-      (pubkey) => !chatProfiles[pubkey] && !requestedChatProfiles.has(pubkey),
+      (pubkey) =>
+        !requestedChatProfiles.has(pubkey) &&
+        now - (chatProfileFetchedAt.get(pubkey) || 0) >=
+          PROFILE_REFRESH_TTL_MS,
     );
-    if (!pending.length || !relays.length) return;
+    const queryRelays = updatePoolRelayScope("profiles", relays);
+    if (!pending.length || !queryRelays.length) return;
     pending.forEach((pubkey) => requestedChatProfiles.add(pubkey));
 
     try {
       const events = await pool.querySync(
-        relays,
+        queryRelays,
         { kinds: [0], authors: pending, limit: pending.length * 3 },
         { maxWait: 4000 },
       );
-      if (session !== chatSession) {
-        pending.forEach((pubkey) => requestedChatProfiles.delete(pubkey));
-        return;
-      }
+      if (session !== chatSession) return;
       const latest = new Map<string, Event>();
       for (const event of events) {
         if (!verifyEvent(event) || event.kind !== 0) continue;
@@ -816,7 +1182,10 @@
       if (Object.keys(profiles).length) {
         chatProfiles = { ...chatProfiles, ...profiles };
       }
+      pending.forEach((pubkey) => chatProfileFetchedAt.set(pubkey, Date.now()));
     } catch {
+      // Profile metadata is best-effort and retried by the next chat poll.
+    } finally {
       pending.forEach((pubkey) => requestedChatProfiles.delete(pubkey));
     }
   }
@@ -848,6 +1217,10 @@
     }
   }
 
+  function invalidateChatProfileRefresh() {
+    chatProfileFetchedAt.clear();
+  }
+
   function chatDisplayName(pubkey: string) {
     const name = chatProfiles[pubkey]?.name;
     if (pubkey === communityContext?.viewer.pubkey) {
@@ -877,8 +1250,11 @@
 
   function stopChat() {
     chatSession += 1;
-    chatSubscription?.close();
-    chatSubscription = null;
+    if (chatPollTimer !== undefined) window.clearTimeout(chatPollTimer);
+    chatPollTimer = undefined;
+    chatFetchSession = 0;
+    clearPoolRelayScope("chat");
+    clearPoolRelayScope("profiles");
     chatMessages = [];
     chatText = "";
     chatLoading = false;
@@ -891,6 +1267,7 @@
       !bridge ||
       !selectedStream ||
       !communityContext?.viewer.pubkey ||
+      !hasNostrControls ||
       chatSending
     )
       return;
@@ -899,6 +1276,10 @@
     const session = chatSession;
     const viewerPubkey = communityContext.viewer.pubkey;
     const relays = chatRelaysFor(selectedStream);
+    if (!relays.length) {
+      chatError = "No valid relays are available for live chat";
+      return;
+    }
     const template: EventTemplate = {
       kind: LIVE_CHAT_KIND,
       created_at: Math.floor(Date.now() / 1000),
@@ -1034,6 +1415,19 @@
     if (document.visibilityState === "visible") retryLoads();
   }
 
+  function stopStreamPolling() {
+    streamPollSession += 1;
+    if (streamPollTimer !== undefined) window.clearTimeout(streamPollTimer);
+    streamPollTimer = undefined;
+  }
+
+  function stopCapabilityPolling() {
+    capabilityPollSession += 1;
+    if (capabilityPollTimer !== undefined)
+      window.clearTimeout(capabilityPollTimer);
+    capabilityPollTimer = undefined;
+  }
+
   $effect(() => {
     const element = mainElement;
     if (!bridge || !element) return;
@@ -1046,14 +1440,69 @@
 
   $effect(() => {
     const ctx = communityContext;
-    if (!bridge || !ctx) return;
-    const interval = window.setInterval(
-      () => {
-        if (document.visibilityState === "visible") void loadStreams(ctx);
-      },
-      POLL_INTERVAL_MS,
-    );
-    return () => window.clearInterval(interval);
+    const instance = bridge;
+    const contextKey = getContextKey(ctx);
+    const supported = hostCapabilityPolicy["community:queryLiveStreams"];
+    const hasDescriptors = getCommunityDescriptors(ctx).length > 0;
+    stopStreamPolling();
+    if (!instance || !ctx || !contextKey) return;
+    const session = streamPollSession;
+    if (!supported || !hasDescriptors) {
+      streamPollTimer = window.setTimeout(() => void loadStreams(ctx), 0);
+      return stopStreamPolling;
+    }
+    let failures = 0;
+    const poll = async () => {
+      if (session !== streamPollSession || !contextIsCurrent(ctx)) return;
+      if (document.visibilityState !== "visible") {
+        streamPollTimer = window.setTimeout(poll, 1_000);
+        return;
+      }
+      const outcome = await loadStreams(ctx);
+      if (session !== streamPollSession) return;
+      failures =
+        outcome === "transient" || outcome === "terminal"
+          ? failures + 1
+          : 0;
+      const delay = getPollDelay(outcome, failures);
+      if (delay !== null) streamPollTimer = window.setTimeout(poll, delay);
+    };
+    streamPollTimer = window.setTimeout(() => void poll(), 0);
+    return stopStreamPolling;
+  });
+
+  $effect(() => {
+    const ctx = communityContext;
+    const instance = bridge;
+    const contextKey = getContextKey(ctx);
+    const supported =
+      hostCapabilityPolicy["community:checkWriteCapabilities"];
+    const hasDescriptors = getCommunityDescriptors(ctx).length > 0;
+    stopCapabilityPolling();
+    if (!instance || !ctx || !contextKey) return;
+    const session = capabilityPollSession;
+    if (!supported || !hasDescriptors) {
+      capabilityPollTimer = window.setTimeout(
+        () => void refreshCapabilities(ctx),
+        0,
+      );
+      return stopCapabilityPolling;
+    }
+    let failures = 0;
+    const poll = async () => {
+      if (session !== capabilityPollSession || !contextIsCurrent(ctx)) return;
+      const outcome = await refreshCapabilities(ctx);
+      if (session !== capabilityPollSession || outcome === "success") return;
+      failures = outcome === "transient" ? failures + 1 : 0;
+      const delay =
+        outcome === "transient" || outcome === "skipped"
+          ? getPollDelay(outcome, failures)
+          : null;
+      if (delay !== null)
+        capabilityPollTimer = window.setTimeout(poll, delay);
+    };
+    capabilityPollTimer = window.setTimeout(() => void poll(), 0);
+    return stopCapabilityPolling;
   });
 
   $effect(() => {
@@ -1084,22 +1533,18 @@
     const instance = createWidgetBridge({
       targetWindow: window.parent,
       targetOrigin: "*",
-      timeoutMs: 20_000,
+      timeoutMs: 45_000,
     });
     bridge = instance;
     const offInit = instance.onEvent("widget:init", (payload) => {
-      initPayload = payload;
+      hostCapabilityCatalog = getHostCapabilityCatalog(payload);
       applyTheme(payload.theme, payload.themeBackground);
       applyCommunityContext(payload.communityContext ?? null);
-      void refreshCapabilities(payload.communityContext ?? null);
-      void loadStreams(payload.communityContext ?? null);
     });
     const offContext = instance.onEvent(
       "community:contextChanged",
       (payload) => {
         applyCommunityContext(payload.communityContext ?? null);
-        void refreshCapabilities(payload.communityContext ?? null);
-        void loadStreams(payload.communityContext ?? null);
       },
     );
     const offTheme = instance.onEvent("widget:themeChanged", (payload) => {
@@ -1111,8 +1556,9 @@
       offInit();
       offContext();
       offTheme();
-      closeLaunchSubscription();
-      closeStreamSubscriptions();
+      stopStreamPolling();
+      stopCapabilityPolling();
+      closeLaunchMonitor();
       stopChat();
       pool.destroy();
       instance.destroy();
@@ -1150,7 +1596,8 @@
         <button
           class="icon-button refresh-action"
           onclick={() => void loadStreams()}
-          disabled={loadingStreams}
+          disabled={loadingStreams ||
+            !hostCapabilityPolicy["community:queryLiveStreams"]}
           title="Refresh streams"
         >
           <span class:spin={loadingStreams}>↻</span>
@@ -1181,6 +1628,15 @@
           {#if loadError}<div class="notice error" role="alert">
               {loadError}
             </div>{/if}
+          {#if capabilityError}<div class="notice error" role="alert">
+              {capabilityError}
+            </div>
+          {:else if communityContext.viewer.pubkey &&
+          descriptors.length &&
+          hostCapabilityPolicy["community:checkWriteCapabilities"] &&
+          !hasLoadedCapabilities}<div class="notice">
+              Checking moderator studio access…
+            </div>{/if}
 
           {#if setupOpen && canModerate}
         <section class="setup" aria-labelledby="setup-title">
@@ -1196,21 +1652,23 @@
             <div class="provider-connect">
               <label>
                 <span>Streaming provider</span>
-                <input
-                  bind:value={providerUrl}
-                  placeholder="https://api-core.zap.stream/api/v1"
-                />
+                 <input
+                   bind:value={providerUrl}
+                   placeholder="https://api-core.zap.stream/api/v1"
+                   disabled={!canConnectProvider}
+                 />
               </label>
               <button
                 class="primary"
                 onclick={() => void connectProvider()}
-                disabled={providerLoading || !initPayload?.pubkey}
+                 disabled={providerLoading || !canConnectProvider}
               >
                 {providerLoading ? "Connecting…" : "Connect with Nostr"}
               </button>
-              <p class="help">
-                Your BudaBit signer authorizes the provider. The widget never
-                sees your private key.
+               <p class="help">
+                 {hasNostrControls
+                   ? "Your current BudaBit signer authorizes the provider. The widget never sees your private key."
+                   : "This host does not advertise both Nostr signing and publishing, so provider controls are unavailable."}
               </p>
             </div>
           {:else}
@@ -1219,11 +1677,9 @@
               <strong>{providerAccount.balance.toLocaleString()} sats</strong>
               <button
                 class="text-button"
-                onclick={() => {
-                  providerAccount = null;
-                  providerClient = null;
-                  prepared = false;
-                }}>Change</button
+                 onclick={() => {
+                   resetSetup(communityContext);
+                 }}>Change</button
               >
             </div>
 
@@ -1241,7 +1697,7 @@
                 <button
                   class="secondary"
                   onclick={() => void acceptProviderTerms()}
-                  disabled={providerLoading}
+                  disabled={providerLoading || !canConnectProvider}
                 >
                   Accept and continue
                 </button>
@@ -1293,7 +1749,7 @@
               <button
                 class="primary"
                 onclick={() => void prepareStream()}
-                disabled={preparing || !selectedEndpoint}
+                disabled={preparing || !selectedEndpoint || !canConnectProvider}
               >
                 {preparing
                   ? "Preparing…"
@@ -1434,15 +1890,19 @@
                 <input
                   bind:value={chatText}
                   maxlength="500"
-                  placeholder={communityContext.viewer.pubkey
-                    ? "Write to the live chat"
-                    : "Log in to chat"}
-                  disabled={!communityContext.viewer.pubkey}
+                  placeholder={!communityContext.viewer.pubkey
+                    ? "Log in to chat"
+                    : hasNostrControls
+                      ? "Write to the live chat"
+                      : "Chat sending is unavailable in this host"}
+                  disabled={!communityContext.viewer.pubkey ||
+                    !hasNostrControls}
                 />
                 <button
                   class="primary compact"
                   disabled={!chatText.trim() ||
                     !communityContext.viewer.pubkey ||
+                    !hasNostrControls ||
                     chatSending}>Send</button
                 >
               </form>
