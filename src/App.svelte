@@ -102,6 +102,7 @@
   let bridge = $state<WidgetBridge | null>(null);
   let hostCapabilityCatalog = $state<string[] | null>(null);
   let communityContext = $state<CommunityWidgetContext | null>(null);
+  let contextChangeAccepted = false;
   let capabilities = $state<CommunityWriteCapability[]>([]);
   let streams = $state<CommunityStream[]>([]);
   let loadingCapabilities = $state(false);
@@ -300,7 +301,9 @@
       ? [
           ctx.contextSessionId,
           ctx.contextVersion,
-          ctx.pubkey,
+          ctx.definitionAddress,
+          ctx.communityId,
+          ctx.ownerPubkey,
           ctx.viewer.pubkey || "",
           ctx.viewer.isOwner ? "owner" : "member",
           ctx.viewer.isBanned ? "banned" : "active",
@@ -703,7 +706,7 @@
     try {
       const preparedAt = Math.floor(Date.now() / 1000);
       const preparationTag = createPreparationTag();
-      const communityTag = `${COMMUNITY_TAG_PREFIX}${communityContext.pubkey.toLowerCase()}`;
+      const communityTag = `${COMMUNITY_TAG_PREFIX}${communityContext.communityId}`;
       const tags = Array.from(
         new Set([
           communityTag,
@@ -725,7 +728,7 @@
       if (
         session !== setupSession ||
         !communityContext ||
-        communityContext.pubkey !== expectedContext.pubkey ||
+        communityContext.definitionAddress !== expectedContext.definitionAddress ||
         communityContext.viewer.pubkey !== expectedContext.viewer.pubkey ||
         communityContext.contextSessionId !== expectedContext.contextSessionId ||
         !canConnectProvider
@@ -743,7 +746,7 @@
         );
       }
       preparedMirrorSession = {
-        communityPubkey: communityContext.pubkey,
+        communityId: communityContext.communityId,
         viewerPubkey: communityContext.viewer.pubkey!,
         contextSessionId: communityContext.contextSessionId,
         preparedAt,
@@ -846,7 +849,7 @@
 
   function currentMirrorContext() {
     return {
-      communityPubkey: communityContext?.pubkey || "",
+      communityId: communityContext?.communityId || "",
       viewerPubkey: communityContext?.viewer.pubkey,
       contextSessionId: communityContext?.contextSessionId || "",
       canModerate,
@@ -871,7 +874,7 @@
     const now = Math.floor(Date.now() / 1000);
     if (
       now > preparedSession.expiresAt ||
-      preparedSession.communityPubkey !== communityContext.pubkey ||
+      preparedSession.communityId !== communityContext.communityId ||
       preparedSession.viewerPubkey !== communityContext.viewer.pubkey ||
       preparedSession.contextSessionId !== communityContext.contextSessionId ||
       !canModerate
@@ -1539,11 +1542,12 @@
     const offInit = instance.onEvent("widget:init", (payload) => {
       hostCapabilityCatalog = getHostCapabilityCatalog(payload);
       applyTheme(payload.theme, payload.themeBackground);
-      applyCommunityContext(payload.communityContext ?? null);
+      if (!contextChangeAccepted) applyCommunityContext(payload.communityContext ?? null);
     });
     const offContext = instance.onEvent(
       "community:contextChanged",
       (payload) => {
+        contextChangeAccepted = true;
         applyCommunityContext(payload.communityContext ?? null);
       },
     );

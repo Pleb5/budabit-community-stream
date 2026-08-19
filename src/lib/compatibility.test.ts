@@ -25,11 +25,13 @@ const context = (
   viewerPubkey: string | undefined,
   overrides: Partial<CommunityWidgetContext> = {},
 ): CommunityWidgetContext => ({
-  version: 1,
+  version: 2,
   contextSessionId: "session",
   contextVersion: 1,
-  pubkey: community,
-  ncommunity: "ncommunity1test",
+  communityId: community as CommunityWidgetContext["communityId"],
+  ownerPubkey: community as CommunityWidgetContext["ownerPubkey"],
+  definitionAddress: `32222:${community}:${community}`,
+  naddr: "naddr1test",
   relays: ["wss://community.example"],
   relayHints: [],
   blossomServers: [],
@@ -110,13 +112,13 @@ describe("host capability policy", () => {
 
 describe("community context transitions", () => {
   it("retains streams but drops viewer-bound state after login", () => {
-    expect(getContextTransitionPolicy(context(undefined), context(viewer))).toEqual(
-      {
-        retainStreams: true,
-        retainCapabilities: false,
-        retainProviderSession: false,
-      },
-    );
+    expect(
+      getContextTransitionPolicy(context(undefined), context(viewer)),
+    ).toEqual({
+      retainStreams: true,
+      retainCapabilities: false,
+      retainProviderSession: false,
+    });
   });
 
   it("revokes viewer-bound authority on a context version change", () => {
@@ -141,7 +143,9 @@ describe("community context transitions", () => {
   });
 
   it("retains authority only for an identical authority context", () => {
-    expect(getContextTransitionPolicy(context(viewer), context(viewer))).toEqual({
+    expect(
+      getContextTransitionPolicy(context(viewer), context(viewer)),
+    ).toEqual({
       retainStreams: true,
       retainCapabilities: true,
       retainProviderSession: true,
@@ -161,11 +165,22 @@ describe("community context transitions", () => {
       retainProviderSession: false,
     });
   });
+
+  it("drops all retained state when the exact definition changes", () => {
+    const next = context(viewer, {
+      definitionAddress: `32222:${"d".repeat(64)}:${community}`,
+    });
+    expect(getContextTransitionPolicy(context(viewer), next)).toEqual({
+      retainStreams: false,
+      retainCapabilities: false,
+      retainProviderSession: false,
+    });
+  });
 });
 
 describe("prepared replacement mirroring", () => {
   const session: PreparedMirrorSession = {
-    communityPubkey: community,
+    communityId: community,
     viewerPubkey: viewer,
     contextSessionId: "session",
     preparedAt: 1_000,
@@ -176,7 +191,7 @@ describe("prepared replacement mirroring", () => {
     providerPubkey: provider,
   };
   const current = {
-    communityPubkey: community,
+    communityId: community,
     viewerPubkey: viewer,
     contextSessionId: "session",
     canModerate: true,
@@ -184,7 +199,13 @@ describe("prepared replacement mirroring", () => {
 
   it("accepts only the current prepared provider address", () => {
     expect(
-      isPreparedMirrorEligible(event(), session, current, new Set([provider]), 1_100),
+      isPreparedMirrorEligible(
+        event(),
+        session,
+        current,
+        new Set([provider]),
+        1_100,
+      ),
     ).toBe(true);
     expect(
       isPreparedMirrorEligible(

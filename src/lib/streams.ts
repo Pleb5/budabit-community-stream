@@ -35,8 +35,8 @@ export const getStreamAddress = (event: Event) => {
   return identifier ? `${LIVE_STREAM_KIND}:${event.pubkey}:${identifier}` : "";
 };
 
-export const hasCommunityTag = (event: Event, communityPubkey: string) => {
-  const normalized = communityPubkey.toLowerCase();
+export const hasCommunityTag = (event: Event, communityId: string) => {
+  const normalized = communityId.toLowerCase();
   return event.tags.some((tag) => {
     const value = tag[1]?.trim().toLowerCase();
     return (

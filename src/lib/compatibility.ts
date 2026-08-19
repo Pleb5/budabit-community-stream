@@ -62,9 +62,7 @@ export const getHostCapabilityCatalog = (payload: unknown): string[] | null => {
   const record = asRecord(payload);
   if (!record) return null;
   const candidate =
-    record.capabilityCatalog ??
-    record.hostCapabilities ??
-    record.capabilities;
+    record.capabilityCatalog ?? record.hostCapabilities ?? record.capabilities;
   const direct = stringCatalog(candidate);
   if (direct) return direct;
   const catalog = asRecord(candidate);
@@ -104,18 +102,16 @@ export const getContextTransitionPolicy = (
   next: CommunityWidgetContext | null,
 ) => {
   const sameCommunity = Boolean(
-    previous &&
-      next &&
-      previous.pubkey.toLowerCase() === next.pubkey.toLowerCase(),
+    previous && next && previous.definitionAddress === next.definitionAddress,
   );
   const sameSession = Boolean(
     sameCommunity && previous?.contextSessionId === next?.contextSessionId,
   );
   const sameViewer = Boolean(
     sameCommunity &&
-      previous?.viewer.pubkey === next?.viewer.pubkey &&
-      previous?.viewer.isOwner === next?.viewer.isOwner &&
-      previous?.viewer.isBanned === next?.viewer.isBanned,
+    previous?.viewer.pubkey === next?.viewer.pubkey &&
+    previous?.viewer.isOwner === next?.viewer.isOwner &&
+    previous?.viewer.isBanned === next?.viewer.isBanned,
   );
   const sameVersion = Boolean(
     sameSession && previous?.contextVersion === next?.contextVersion,
@@ -142,7 +138,7 @@ export const canConnectProvider = (
   policy["nostr:publish"];
 
 export type PreparedMirrorSession = {
-  communityPubkey: string;
+  communityId: string;
   viewerPubkey: string;
   contextSessionId: string;
   preparedAt: number;
@@ -155,7 +151,7 @@ export type PreparedMirrorSession = {
 };
 
 export type CurrentMirrorContext = {
-  communityPubkey: string;
+  communityId: string;
   viewerPubkey?: string;
   contextSessionId: string;
   canModerate: boolean;
@@ -170,8 +166,7 @@ export const isPreparedMirrorEligible = (
 ) => {
   if (!session || !current.canModerate) return false;
   if (
-    session.communityPubkey.toLowerCase() !==
-      current.communityPubkey.toLowerCase() ||
+    session.communityId !== current.communityId ||
     session.viewerPubkey !== current.viewerPubkey ||
     session.contextSessionId !== current.contextSessionId ||
     now > session.expiresAt ||
@@ -183,7 +178,7 @@ export const isPreparedMirrorEligible = (
     !event.tags.some(
       (tag) => tag[0] === "t" && tag[1] === session.sessionTag,
     ) ||
-    !hasCommunityTag(event, current.communityPubkey) ||
+    !hasCommunityTag(event, current.communityId) ||
     !event.tags.some(
       (tag) =>
         tag[0] === "p" &&
@@ -202,9 +197,9 @@ export const isPreparedMirrorEligible = (
     (status === "ended" && Boolean(session.streamAddress));
   return Boolean(
     address &&
-      eligibleStatus &&
-      (!session.streamIdentifier || identifier === session.streamIdentifier) &&
-      (!session.streamAddress || address === session.streamAddress),
+    eligibleStatus &&
+    (!session.streamIdentifier || identifier === session.streamIdentifier) &&
+    (!session.streamAddress || address === session.streamAddress),
   );
 };
 
@@ -222,13 +217,7 @@ export const getNextPreparedMirrorEvent = (
         right.created_at - left.created_at || left.id.localeCompare(right.id),
     )
     .find((event) =>
-      isPreparedMirrorEligible(
-        event,
-        session,
-        current,
-        trustedProviders,
-        now,
-      ),
+      isPreparedMirrorEligible(event, session, current, trustedProviders, now),
     );
   return latest && !mirroredEventIds.has(latest.id) ? latest : undefined;
 };
