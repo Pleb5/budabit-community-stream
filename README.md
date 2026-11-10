@@ -16,6 +16,7 @@ Streaming widget extension for BudaBit communities. Moderators prepare an OBS br
 - Multiple planned/live streams listed at once
 - Host-managed `community:queryLiveStreams` polling with transient retry backoff
 - Compact accordion by default with user-controlled expansion and automatic expansion when the community goes live
+- Timer-backed sizing for offscreen frames, with fresh measurements after host initialization and viewport changes
 
 The widget does not store private keys or RTMP stream keys. Provider credentials remain in memory and are retrieved again after a reload.
 
@@ -75,6 +76,12 @@ It renders in `community-home-after-quicklinks`.
 ## Provider Notes
 
 Starting media means starting the OBS encoder. The widget intentionally does not expose a dedicated live publish or provider-stop API; stop the broadcast in OBS. The provider updates the NIP-53 event to `ended` when ingest disconnects. Automatic replacement mirroring expires after six hours and is limited to the provider/address detected for the current moderator-initiated prepared session.
+
+To broadcast a Community Call, join the call and use OBS window capture plus the
+intended call audio output as the encoder source. HiveTalk on `calls.budabit.club`
+currently has its server-side RTMP controls disabled; starting a call alone does
+not start a Nostr broadcast. Prepare the provider in this widget, enter its ingest
+server/key in OBS, and verify playback from a second participant before launch.
 
 The standard zap-stream provider API does not return its Nostr signer or a newly prepared stream identifier. The widget resolves the selected API URL against a trusted NIP-89 provider advertisement (or an explicit trusted provider hint), then writes a unique per-preparation tag through that provider. If no stream identifier is returned, initial detection uses the strictest available binding: the resolved provider, exact preparation tag, current viewer host tag, community tag, active status, and preparation time window. The first match pins the stream address. Providers that cannot establish a trusted signer identity are rejected.
 

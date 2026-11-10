@@ -15,6 +15,7 @@
     type EventTemplate,
   } from "nostr-tools/pure";
   import HlsPlayer from "./HlsPlayer.svelte";
+  import { createHostResizer } from "./lib/host-resize";
   import {
     COMMUNITY_TAG_PREFIX,
     LIVE_CHAT_KIND,
@@ -116,8 +117,10 @@
   let setupOpen = $state(false);
   let widgetTheme = $state<WidgetTheme>("light");
   let mainElement = $state<HTMLElement | null>(null);
-  let lastRequestedHeight = 0;
-  let resizeFrame: number | undefined;
+  const hostResizer = createHostResizer({
+    measure: () => bridge ? getContentHeight() : undefined,
+    request: (height) => bridge!.request("ui:resize", { height }),
+  });
 
   let providerUrl = $state(DEFAULT_PROVIDER_URL);
   let providerClient = $state<StreamProviderClient | null>(null);
@@ -409,8 +412,7 @@
       setupOpen = false;
       resetSetup(ctx);
     }
-    lastRequestedHeight = 0;
-    scheduleHostResize();
+    hostResizer.reset();
   }
 
   async function showToast(
@@ -1389,23 +1391,8 @@
     );
   }
 
-  function requestHostResize() {
-    if (!bridge) return;
-    const height = getContentHeight();
-    if (!Number.isFinite(height) || Math.abs(height - lastRequestedHeight) < 2)
-      return;
-    lastRequestedHeight = height;
-    void bridge.request("ui:resize", { height }).catch(() => {});
-  }
-
   function scheduleHostResize() {
-    if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-    resizeFrame = requestAnimationFrame(() => {
-      resizeFrame = requestAnimationFrame(() => {
-        resizeFrame = undefined;
-        requestHostResize();
-      });
-    });
+    hostResizer.schedule();
   }
 
   function retryLoads() {
@@ -1509,11 +1496,13 @@
   });
 
   $effect(() => {
+    window.addEventListener("resize", scheduleHostResize);
     window.addEventListener("pageshow", retryLoads);
     window.addEventListener("focus", retryLoads);
     window.addEventListener("online", retryLoads);
     document.addEventListener("visibilitychange", retryVisibleLoads);
     return () => {
+      window.removeEventListener("resize", scheduleHostResize);
       window.removeEventListener("pageshow", retryLoads);
       window.removeEventListener("focus", retryLoads);
       window.removeEventListener("online", retryLoads);
@@ -1540,6 +1529,7 @@
     });
     bridge = instance;
     const offInit = instance.onEvent("widget:init", (payload) => {
+      hostResizer.reset();
       hostCapabilityCatalog = getHostCapabilityCatalog(payload);
       applyTheme(payload.theme, payload.themeBackground);
       if (!contextChangeAccepted) applyCommunityContext(payload.communityContext ?? null);
@@ -1565,6 +1555,7 @@
       closeLaunchMonitor();
       stopChat();
       pool.destroy();
+      hostResizer.destroy();
       instance.destroy();
       bridge = null;
     };
