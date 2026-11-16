@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import packageJson from "../../package.json";
 
 describe("widget manifest", () => {
+  it("keeps the manifest release version aligned with the package", () => {
+    expect(packageJson.scripts.manifest).toContain(`--version '${packageJson.version}'`);
+    expect(packageJson.scripts.manifest).toContain("community:getMediaState,community:setMediaState");
+  });
   it("uses release-safe icon defaults", () => {
     const manifestScript = packageJson.scripts.manifest;
 

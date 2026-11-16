@@ -50,17 +50,17 @@ const trustedProviderHint = (
 
 export const getProviderPreparationBinding = (
   account: ProviderAccount,
-  update: StreamUpdateResult,
+  update: StreamUpdateResult | null | undefined,
   trustedProviders: ReadonlySet<string>,
 ) => ({
   streamIdentifier:
-    validIdentifier(update.id) ||
-    validIdentifier(update.details?.id) ||
+    validIdentifier(update?.id) ||
+    validIdentifier(update?.details?.id) ||
     validIdentifier(account.details?.id),
   providerPubkey: trustedProviderHint(
     [
-      update.provider_pubkey,
-      update.service_pubkey,
+      update?.provider_pubkey,
+      update?.service_pubkey,
       account.provider_pubkey,
       account.service_pubkey,
     ],
@@ -97,29 +97,74 @@ export const normalizeProviderUrl = (value: string) => {
   return url.toString().replace(/\/$/, "");
 };
 
+export const PROVIDER_ADVERTISEMENT_KIND = 31_990;
+
+export type ProviderAdvertisement = {
+  pubkey: string;
+  identifier: string;
+  url: string;
+};
+
+const getProviderAdvertisements = (
+  events: Event[],
+  trustedProviders: ReadonlySet<string>,
+): ProviderAdvertisement[] => {
+  const latest = new Map<string, Event>();
+  // Select addressable replacements before parsing metadata, so an invalid new
+  // advertisement cannot resurrect an obsolete endpoint from an older event.
+  for (const event of [...events].sort(
+    (left, right) =>
+      right.created_at - left.created_at || left.id.localeCompare(right.id),
+  )) {
+    if (
+      event.kind !== PROVIDER_ADVERTISEMENT_KIND ||
+      !trustedProviders.has(event.pubkey.toLowerCase()) ||
+      !verifyEvent(event)
+    ) continue;
+    const identifier = event.tags.find((tag) => tag[0] === "d")?.[1];
+    if (!identifier) continue;
+    const address = `${event.pubkey}:${identifier}`;
+    if (!latest.has(address)) latest.set(address, event);
+  }
+  return [...latest.values()].flatMap((event) => {
+    if (
+      !event.tags.some((tag) => tag[0] === "k" && tag[1] === "30311") ||
+      !event.tags.some((tag) => tag[0] === "i" && tag[1] === "api:zap-stream")
+    ) return [];
+    try {
+      const metadata = JSON.parse(event.content);
+      if (typeof metadata?.website !== "string") return [];
+      const url = new URL(metadata.website);
+      if (url.protocol !== "https:" || url.username || url.password) return [];
+      return [{
+        pubkey: event.pubkey.toLowerCase(),
+        identifier: event.tags.find((tag) => tag[0] === "d")![1],
+        url: normalizeProviderUrl(metadata.website),
+      }];
+    } catch {
+      return [];
+    }
+  });
+};
+
+export const getDefaultProviderAdvertisement = (
+  events: Event[],
+  trustedProviders: ReadonlySet<string>,
+) => {
+  const advertisements = getProviderAdvertisements(events, trustedProviders);
+  // zap.stream advertises regional alternatives separately. Prefer its primary
+  // service even if a regional advertisement was published more recently.
+  return advertisements.find((item) => item.identifier === "zap-stream-core") ||
+    advertisements[0];
+};
+
 export const getAdvertisedProviderPubkey = (
   events: Event[],
   baseUrl: string,
   trustedProviders: ReadonlySet<string>,
-) =>
-  [...events]
-    .filter(
-      (event) =>
-        verifyEvent(event) && trustedProviders.has(event.pubkey.toLowerCase()),
-    )
-    .sort((left, right) => right.created_at - left.created_at)
-    .find((event) => {
-      try {
-        const metadata = JSON.parse(event.content) as Record<string, unknown>;
-        return (
-          typeof metadata.website === "string" &&
-          normalizeProviderUrl(metadata.website) === baseUrl
-        );
-      } catch {
-        return false;
-      }
-    })
-    ?.pubkey.toLowerCase();
+) => getProviderAdvertisements(events, trustedProviders)
+  .find((advertisement) => advertisement.url === normalizeProviderUrl(baseUrl))
+  ?.pubkey;
 
 export class StreamProviderClient {
   private offsetMs = 0;
@@ -149,8 +194,13 @@ export class StreamProviderClient {
     return this.request<ProviderAccount>("GET", "account");
   }
 
-  updateStream(details: StreamDetails) {
-    return this.request<StreamUpdateResult>("PATCH", "event", details);
+  async updateStream(details: StreamDetails): Promise<StreamUpdateResult> {
+    // zap-stream-core's update handler returns unit, serialized as JSON null.
+    // A successful update need not return a stream ID or provider identity.
+    const result = await this.request<StreamUpdateResult | null>(
+      "PATCH", "event", details,
+    );
+    return result ?? {};
   }
 
   acceptTerms() {

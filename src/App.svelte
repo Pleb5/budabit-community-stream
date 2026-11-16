@@ -15,6 +15,7 @@
     type EventTemplate,
   } from "nostr-tools/pure";
   import HlsPlayer from "./HlsPlayer.svelte";
+  import type {LocalMediaState} from "./lib/stream-audio";
   import { createHostResizer } from "./lib/host-resize";
   import {
     COMMUNITY_TAG_PREFIX,
@@ -31,7 +32,10 @@
     normalizeProviderUrl,
     StreamProviderClient,
     getAdvertisedProviderPubkey,
+    getDefaultProviderAdvertisement,
     getProviderPreparationBinding,
+    PROVIDER_ADVERTISEMENT_KIND,
+    type ProviderAdvertisement,
     type IngestEndpoint,
     type ProviderAccount,
   } from "./lib/provider";
@@ -65,8 +69,7 @@
   type ChatProfile = { name?: string; picture?: string };
 
   const DEFAULT_PROVIDER_URL =
-    import.meta.env.VITE_STREAM_PROVIDER_URL ||
-    "https://api-core.zap.stream/api/v1";
+    import.meta.env.VITE_STREAM_PROVIDER_URL?.trim() || "";
   const DEFAULT_PUBLIC_RELAYS = [
     "wss://relay.snort.social",
     "wss://nos.lol",
@@ -83,7 +86,6 @@
   const LAUNCH_POLL_INTERVAL_MS = 7_500;
   const PREPARED_SESSION_SECONDS = 6 * 60 * 60;
   const PROFILE_REFRESH_TTL_MS = 5 * 60 * 1_000;
-  const PROVIDER_ADVERTISEMENT_KIND = 31_990;
   const CHAT_LIMIT = 150;
   const MIN_COLLAPSED_HEIGHT = 76;
 
@@ -123,6 +125,10 @@
   });
 
   let providerUrl = $state(DEFAULT_PROVIDER_URL);
+  let providerDiscovering = $state(false);
+  let discoveredProvider: ProviderAdvertisement | undefined;
+  let providerDiscoverySession = 0;
+  let providerQuerySession = 0;
   let providerClient = $state<StreamProviderClient | null>(null);
   let providerAccount = $state<ProviderAccount | null>(null);
   let providerPubkey = $state("");
@@ -136,6 +142,12 @@
   let streamTags = $state("");
   let publicRelayInput = $state(configuredPublicRelays.join(", "));
   let prepared = $state(false);
+  let localMedia = $state<LocalMediaState>({ready: false, callActive: false, broadcastPrepared: false});
+  let mediaRevision = -1;
+  let mediaStateError = $state("");
+  let clearingBroadcastProtection = $state(false);
+  let localBroadcastIntent = $state(false);
+  let reportedBroadcastSetup = "";
   let preparing = $state(false);
   let launchStatus = $state("");
 
@@ -206,6 +218,10 @@
   const selectedStream = $derived(
     streams.find((stream) => stream.address === joinedAddress) || null,
   );
+  const playbackAudioContext = $derived({
+    ...localMedia,
+    broadcastPrepared: localMedia.broadcastPrepared || localBroadcastIntent,
+  });
   const selectedEndpoint = $derived(
     providerAccount?.endpoints.find(
       (endpoint) => endpoint.name === selectedEndpointName,
@@ -263,6 +279,12 @@
 
   function clearPoolRelayScope(scope: string) {
     updatePoolRelayScope(scope, []);
+  }
+
+  function clearProviderQueryScopes(prefix: string) {
+    for (const scope of poolRelayScopes.keys()) {
+      if (scope.startsWith(`${prefix}:`)) clearPoolRelayScope(scope);
+    }
   }
 
   function sameRelaySet(left: string[], right: string[]) {
@@ -349,7 +371,11 @@
   function resetSetup(ctx: CommunityWidgetContext | null) {
     setupSession += 1;
     closeLaunchMonitor();
-    clearPoolRelayScope("provider-identity");
+    clearProviderQueryScopes("provider-identity");
+    clearProviderQueryScopes("provider-discovery");
+    providerDiscoverySession += 1;
+    providerDiscovering = false;
+    discoveredProvider = undefined;
     preparedMirrorSession = null;
     mirrorPromises.clear();
     mirroredEventIds.clear();
@@ -380,6 +406,12 @@
 
   function applyCommunityContext(ctx: CommunityWidgetContext | null) {
     const previous = communityContext;
+    if (getContextKey(previous) !== getContextKey(ctx)) {
+      localMedia = {ready: false, callActive: false, broadcastPrepared: false};
+      mediaRevision = -1;
+      mediaStateError = "";
+      localBroadcastIntent = false;
+    }
     const transition = getContextTransitionPolicy(previous, ctx);
     const selectedBeforeChange = streams.find(
       (stream) => stream.address === joinedAddress,
@@ -604,7 +636,50 @@
     expanded = true;
     setupOpen = true;
     providerError = "";
+    if (!providerUrl && !providerAccount) void discoverDefaultProvider();
     scheduleHostResize();
+  }
+
+  function editProviderUrl() {
+    providerDiscoverySession += 1;
+    providerDiscovering = false;
+    discoveredProvider = undefined;
+    providerError = "";
+    clearProviderQueryScopes("provider-discovery");
+  }
+
+  async function discoverDefaultProvider() {
+    if (providerDiscovering || providerLoading || !canModerate) return;
+    const session = ++providerDiscoverySession;
+    const setup = setupSession;
+    providerDiscovering = true;
+    providerError = "";
+    discoveredProvider = undefined;
+    providerUrl = "";
+    try {
+      const events = await queryProviderAdvertisements("provider-discovery");
+      if (session !== providerDiscoverySession || setup !== setupSession) return;
+      const advertisement = getDefaultProviderAdvertisement(
+        events,
+        trustedProviders,
+      );
+      if (!advertisement) {
+        throw new Error(
+          "No trusted streaming provider advertisement was found. Retry discovery or enter a custom provider URL.",
+        );
+      }
+      discoveredProvider = advertisement;
+      providerUrl = advertisement.url;
+    } catch (error) {
+      if (session === providerDiscoverySession && setup === setupSession) {
+        providerError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (session === providerDiscoverySession && setup === setupSession) {
+        providerDiscovering = false;
+        scheduleHostResize();
+      }
+    }
   }
 
   function closeSetup() {
@@ -613,7 +688,13 @@
   }
 
   async function connectProvider() {
-    if (!bridge || !communityContext || !canConnectProvider || providerLoading)
+    if (
+      !bridge ||
+      !communityContext ||
+      !canConnectProvider ||
+      providerLoading ||
+      providerDiscovering
+    )
       return;
     const session = setupSession;
     providerLoading = true;
@@ -803,30 +884,17 @@
       {},
       trustedProviders,
     ).providerPubkey;
+    if (discoveredProvider?.url === baseUrl) {
+      if (hint && hint !== discoveredProvider.pubkey) {
+        throw new Error(
+          "The provider returned a signer that does not match its trusted advertisement.",
+        );
+      }
+      return discoveredProvider.pubkey;
+    }
     if (hint) return hint;
 
-    const relays = updatePoolRelayScope("provider-identity", [
-      ...configuredPublicRelays,
-      ...(communityContext?.relays || []),
-    ]);
-    if (!relays.length) {
-      throw new Error("No valid relays are available to verify the provider.");
-    }
-    let events: Event[];
-    try {
-      events = await pool.querySync(
-        relays,
-        {
-          kinds: [PROVIDER_ADVERTISEMENT_KIND],
-          authors: Array.from(trustedProviders),
-          "#k": [String(LIVE_STREAM_KIND)],
-          limit: Math.max(20, trustedProviders.size * 4),
-        },
-        { maxWait: 4_000 },
-      );
-    } finally {
-      clearPoolRelayScope("provider-identity");
-    }
+    const events = await queryProviderAdvertisements("provider-identity");
     const advertisedPubkey = getAdvertisedProviderPubkey(
       events,
       baseUrl,
@@ -838,6 +906,32 @@
       );
     }
     return advertisedPubkey;
+  }
+
+  async function queryProviderAdvertisements(prefix: string) {
+    // Each request owns its scope: an old request's finally must not close the
+    // connections of a newer discovery after a manual edit or context change.
+    const scope = `${prefix}:${++providerQuerySession}`;
+    const relays = updatePoolRelayScope(scope, [
+      ...configuredPublicRelays,
+      ...(communityContext?.relays || []),
+    ]);
+    if (!relays.length) {
+      throw new Error("No valid relays are available to verify the provider.");
+    }
+    try {
+      return await pool.querySync(
+        relays,
+        {
+          kinds: [PROVIDER_ADVERTISEMENT_KIND],
+          authors: Array.from(trustedProviders),
+          limit: Math.max(20, trustedProviders.size * 4),
+        },
+        { maxWait: 4_000 },
+      );
+    } finally {
+      clearPoolRelayScope(scope);
+    }
   }
 
   async function copyValue(value: string, label: string) {
@@ -1418,6 +1512,84 @@
     capabilityPollTimer = undefined;
   }
 
+  function applyMediaState(value: unknown) {
+    if (!value || typeof value !== "object" || !communityContext) return;
+    if ("error" in value) {
+      mediaStateError = "Participation detection is unavailable. Choose stream audio manually.";
+      return;
+    }
+    const state = value as ContextResponse & {
+      status?: unknown; callActive?: unknown; broadcastPrepared?: unknown; revision?: unknown;
+    };
+    if (state.status !== "ok" || !responseMatchesContext(state, communityContext) ||
+        typeof state.callActive !== "boolean" || typeof state.broadcastPrepared !== "boolean" ||
+        typeof state.revision !== "number" || !Number.isSafeInteger(state.revision) ||
+        state.revision < mediaRevision) return;
+    mediaRevision = state.revision;
+    localMedia = {ready: true, callActive: state.callActive, broadcastPrepared: state.broadcastPrepared};
+    mediaStateError = "";
+  }
+
+  async function clearBroadcastProtection() {
+    const ctx = communityContext;
+    if (!ctx || !bridge || clearingBroadcastProtection) return;
+    clearingBroadcastProtection = true;
+    try {
+      const result = await bridge.request("community:setMediaState", {
+        contextSessionId: ctx.contextSessionId, contextVersion: ctx.contextVersion,
+        activity: "broadcast", active: false,
+      });
+      if (contextIsCurrent(ctx)) {
+        applyMediaState(result);
+        if (result && typeof result === "object" && "status" in result && result.status === "ok") {
+          localBroadcastIntent = false;
+        }
+      }
+    } catch {
+      if (contextIsCurrent(ctx)) mediaStateError = "Could not clear local preview protection.";
+    } finally {
+      clearingBroadcastProtection = false;
+    }
+  }
+
+  $effect(() => {
+    const ctx = communityContext;
+    const instance = bridge;
+    const supported = hostCapabilityCatalog?.includes("community:getMediaState");
+    if (!ctx || !instance) return;
+    if (!supported) {
+      mediaStateError = "This host cannot detect local call/broadcast participation. Choose stream audio manually.";
+      return;
+    }
+    void instance.request("community:getMediaState", {
+      contextSessionId: ctx.contextSessionId, contextVersion: ctx.contextVersion,
+    }).then(value => {
+      if (contextIsCurrent(ctx)) applyMediaState(value);
+    }).catch(() => {
+      if (contextIsCurrent(ctx)) mediaStateError = "Participation detection failed. Choose stream audio manually.";
+    });
+  });
+
+  $effect(() => {
+    const ctx = communityContext;
+    const instance = bridge;
+    const active = preparing || prepared;
+    if (!ctx || !instance || !active) return;
+    const reportKey = `${ctx.definitionAddress}:${ctx.viewer.pubkey}:${setupSession}`;
+    if (reportedBroadcastSetup === reportKey) return;
+    localBroadcastIntent = true;
+    if (!hostCapabilityCatalog?.includes("community:setMediaState")) return;
+    reportedBroadcastSetup = reportKey;
+    // This is an intent/safety hint, never a claim that OBS is actually running.
+    // Keep it across reset/reload until the operator explicitly clears it.
+    void instance.request("community:setMediaState", {
+      contextSessionId: ctx.contextSessionId, contextVersion: ctx.contextVersion,
+      activity: "broadcast", active: true,
+    }).then(value => {
+      if (contextIsCurrent(ctx)) applyMediaState(value);
+    }).catch(() => { if (reportedBroadcastSetup === reportKey) reportedBroadcastSetup = ""; });
+  });
+
   $effect(() => {
     const element = mainElement;
     if (!bridge || !element) return;
@@ -1544,12 +1716,14 @@
     const offTheme = instance.onEvent("widget:themeChanged", (payload) => {
       applyTheme(payload.theme, payload.themeBackground);
     });
+    const offMedia = instance.onEvent("community:mediaStateChanged", applyMediaState);
     instance.signalReady();
 
     return () => {
       offInit();
       offContext();
       offTheme();
+      offMedia();
       stopStreamPolling();
       stopCapabilityPolling();
       closeLaunchMonitor();
@@ -1647,24 +1821,39 @@
             <div class="provider-connect">
               <label>
                 <span>Streaming provider</span>
-                 <input
-                   bind:value={providerUrl}
-                   placeholder="https://api-core.zap.stream/api/v1"
-                   disabled={!canConnectProvider}
-                 />
+                <input
+                  bind:value={providerUrl}
+                  oninput={editProviderUrl}
+                  placeholder={providerDiscovering
+                    ? "Discovering provider…"
+                    : "https://your-provider.example/api/v1"}
+                  disabled={!canConnectProvider || providerLoading}
+                />
               </label>
               <button
                 class="primary"
                 onclick={() => void connectProvider()}
-                 disabled={providerLoading || !canConnectProvider}
+                disabled={providerLoading || providerDiscovering ||
+                  !providerUrl.trim() || !canConnectProvider}
               >
                 {providerLoading ? "Connecting…" : "Connect with Nostr"}
               </button>
-               <p class="help">
-                 {hasNostrControls
-                   ? "Your current BudaBit signer authorizes the provider. The widget never sees your private key."
-                   : "This host does not advertise both Nostr signing and publishing, so provider controls are unavailable."}
+              <p class="help">
+                {hasNostrControls
+                  ? "Your current BudaBit signer authorizes the provider. The widget never sees your private key."
+                  : "This host does not advertise both Nostr signing and publishing, so provider controls are unavailable."}
               </p>
+              <div class="help" aria-live="polite">
+                {#if providerDiscovering}
+                  Discovering the default endpoint from trusted Nostr advertisements…
+                {:else}
+                  <button
+                    class="text-button"
+                    onclick={() => void discoverDefaultProvider()}
+                    disabled={providerLoading || !canConnectProvider}
+                  >Use advertised provider</button>
+                {/if}
+              </div>
             </div>
           {:else}
             <div class="provider-summary">
@@ -1674,6 +1863,7 @@
                 class="text-button"
                  onclick={() => {
                    resetSetup(communityContext);
+                   if (!providerUrl) void discoverDefaultProvider();
                  }}>Change</button
               >
             </div>
@@ -1808,13 +1998,31 @@
               >Leave stream</button
             >
           </div>
+          {#if canModerate}
+            <details class="notice">
+              <summary>OBS: record, broadcast, or switch to private discussion</summary>
+              <p>Start recording and streaming independently in OBS. For private discussion, stop BOTH outputs using OBS controls or separate Stop hotkeys, and verify both timers have stopped. Keep the call connected.</p>
+              <p>This widget cannot control or verify OBS. Leaving this player, ending a call listing, or muting audio does not stop recording or streaming. Viewers may still see buffered footage; other participants can record independently. Tell participants before resuming.</p>
+              <p>Capture the call rather than this preview. Keep this player muted on the broadcaster, use headphones, and leave OBS audio monitoring off.</p>
+            </details>
+          {/if}
           <div class="watch-grid">
             <div>
               <HlsPlayer
                 src={selectedStream.playbackUrl || selectedStream.recordingUrl}
+                audioContext={playbackAudioContext}
+                streamKey={`${communityContext?.definitionAddress}:${communityContext?.viewer.pubkey || ""}:${selectedStream.address}`}
                 poster={selectedStream.thumbnail || selectedStream.image}
                 title={selectedStream.title}
               />
+              {#if mediaStateError}<p class="notice" role="status">{mediaStateError}</p>{/if}
+              {#if playbackAudioContext.broadcastPrepared}
+                <div class="notice">
+                  <p>Broadcast audio protection was enabled in this tab. It survives refresh; it does not report OBS status. Clear it only after stopping both OBS outputs. Clearing it does not automatically unmute the player.</p>
+                  <button class="secondary" disabled={clearingBroadcastProtection}
+                    onclick={() => void clearBroadcastProtection()}>OBS outputs stopped: clear preview protection</button>
+                </div>
+              {/if}
               {#if selectedStream.summary}<p class="stream-summary">
                   {selectedStream.summary}
                 </p>{/if}

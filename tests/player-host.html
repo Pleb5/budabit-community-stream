@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <title>Nested stream presentation fixture</title>
+  <iframe title="Stream widget"
+    sandbox="allow-scripts allow-same-origin" allow="autoplay; fullscreen *"
+    style="width:100%;height:850px;border:0"></iframe>
+  <script>
+    const url = new URL("http://127.0.0.1:5188/tests/player.html");
+    url.search = location.search;
+    document.querySelector("iframe").src = url;
+  </script>
+</html>
