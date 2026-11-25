@@ -524,6 +524,7 @@
 
   async function loadStreams(
     ctx = communityContext,
+    options: { forceReconcile?: boolean } = {},
   ): Promise<LoadOutcome> {
     if (!bridge || !ctx) return "unavailable";
     if (loadingStreams) {
@@ -602,7 +603,7 @@
           trustedProviders.has(stream.event.pubkey.toLowerCase()),
       );
       if (activeProviderStreams.length) {
-        void reconcileProviderStreams(activeProviderStreams, expected);
+        void reconcileProviderStreams(activeProviderStreams, expected, Boolean(options.forceReconcile));
       }
       return "success";
     } catch (error) {
@@ -1524,9 +1525,10 @@
   async function reconcileProviderStreams(
     targets: CommunityStream[],
     expected: CommunityWidgetContext,
+    force = false,
   ) {
     const now = Date.now();
-    if (reconcilingStreams || now - lastReconcileAt < 15_000) return;
+    if (reconcilingStreams || (!force && now - lastReconcileAt < 15_000)) return;
     reconcilingStreams = true;
     lastReconcileAt = now;
     try {
@@ -1573,70 +1575,45 @@
 
   async function endStream(stream: CommunityStream) {
     const ctx = communityContext;
-    if (!bridge || !ctx || !canModerate || endingAddress) return;
+    if (
+      !bridge ||
+      !ctx ||
+      !canModerate ||
+      endingAddress ||
+      stream.event.pubkey !== ctx.viewer.pubkey
+    )
+      return;
+    if (!hasNostrControls) {
+      await showToast(
+        "This host does not allow signing stream updates.",
+        "warning",
+      );
+      return;
+    }
     endingAddress = stream.address;
     try {
-      if (stream.event.pubkey === ctx.viewer.pubkey) {
-        if (!hasNostrControls) {
-          await showToast(
-            "This host does not allow signing stream updates.",
-            "warning",
-          );
-          return;
-        }
-        const template = buildEndedStreamTemplate(stream);
-        const signResponse = (await bridge.request(
-          "nostr:sign",
-          template,
-        )) as NostrSignResponse;
-        if ("error" in signResponse) throw new Error(signResponse.error);
-        const signed = signResponse.event as Event;
-        if (!verifyEvent(signed)) {
-          throw new Error("The signer returned an invalid event");
-        }
-        const relays = normalizeRelays([
-          ...(ctx.relays || []),
-          ...configuredPublicRelays,
-        ]);
-        const pubResponse = (await bridge.request("nostr:publish", {
-          event: signed,
-          relays,
-        })) as NostrPublishResponse;
-        if ("error" in pubResponse) throw new Error(pubResponse.error);
-        if (joinedAddress === stream.address) leaveStream();
-        await showToast("Stream ended.", "success");
-        void loadStreams(ctx);
-        return;
+      const template = buildEndedStreamTemplate(stream);
+      const signResponse = (await bridge.request(
+        "nostr:sign",
+        template,
+      )) as NostrSignResponse;
+      if ("error" in signResponse) throw new Error(signResponse.error);
+      const signed = signResponse.event as Event;
+      if (!verifyEvent(signed)) {
+        throw new Error("The signer returned an invalid event");
       }
-
-      const candidates = await queryPublicStreamReplacements(stream);
-      if (!contextIsCurrent(ctx)) return;
-      const newer = selectNewerStreamReplacement(
-        stream,
-        candidates,
-        ctx.communityId,
-      );
-      const parsed = newer ? parseStreamEvent(newer, trustedProviders) : null;
-      if (newer && parsed && (parsed.status === "ended" || parsed.status === "vod")) {
-        streams = retainVisibleStreams(
-          selectLatestStreamReplacements([...streams, parsed]),
-        ).sort(compareStreams);
-        if (hasNostrControls) {
-          await publishReplacementToCommunity(newer, ctx);
-          reconciledEventIds.add(newer.id);
-        }
-        if (joinedAddress === stream.address) leaveStream();
-        await showToast(
-          "Stream ended and synced to the community relay.",
-          "success",
-        );
-        void loadStreams(ctx);
-      } else {
-        await showToast(
-          "Provider still reports this stream as live. Stop Streaming in OBS, wait ~15s, then click End stream again.",
-          "warning",
-        );
-      }
+      const relays = normalizeRelays([
+        ...(ctx.relays || []),
+        ...configuredPublicRelays,
+      ]);
+      const pubResponse = (await bridge.request("nostr:publish", {
+        event: signed,
+        relays,
+      })) as NostrPublishResponse;
+      if ("error" in pubResponse) throw new Error(pubResponse.error);
+      if (joinedAddress === stream.address) leaveStream();
+      await showToast("Stream ended.", "success");
+      void loadStreams(ctx);
     } catch (error) {
       await showToast(
         error instanceof Error ? error.message : "Could not end stream",
@@ -1956,10 +1933,10 @@
       <div class="masthead-actions">
         <button
           class="icon-button refresh-action"
-          onclick={() => void loadStreams()}
+          onclick={() => void loadStreams(communityContext, { forceReconcile: true })}
           disabled={loadingStreams ||
             !hostCapabilityPolicy["community:queryLiveStreams"]}
-          title="Refresh streams"
+          title="Refresh and sync streams"
         >
           <span class:spin={loadingStreams}>↻</span>
         </button>
@@ -2191,7 +2168,7 @@
                 class="secondary compact"
                 onclick={() => void shareStream(selectedStream)}>Share</button
               >
-              {#if canModerate && selectedStream.status === "live"}
+              {#if canModerate && selectedStream.status === "live" && selectedStream.event.pubkey === communityContext?.viewer.pubkey}
                 <button
                   class="secondary compact"
                   disabled={endingAddress === selectedStream.address}
@@ -2369,7 +2346,7 @@
                   class="secondary compact"
                   onclick={() => void shareStream(stream)}>Share</button
                 >
-                {#if canModerate && stream.status === "live"}
+                {#if canModerate && stream.status === "live" && stream.event.pubkey === communityContext?.viewer.pubkey}
                   <button
                     class="secondary compact"
                     disabled={endingAddress === stream.address}
