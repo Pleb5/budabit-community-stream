@@ -15,6 +15,7 @@
     type EventTemplate,
   } from "nostr-tools/pure";
   import HlsPlayer from "./HlsPlayer.svelte";
+  import { buildCommunityNsiteUrl } from "./lib/nsite";
   import type {LocalMediaState} from "./lib/stream-audio";
   import { createHostResizer } from "./lib/host-resize";
   import {
@@ -1447,6 +1448,14 @@
   }
 
   async function shareStream(stream: CommunityStream) {
+    const nsiteUrl = buildCommunityNsiteUrl(
+      communityContext?.ownerPubkey || "",
+      "stream",
+    );
+    if (nsiteUrl) {
+      await copyValue(nsiteUrl, "Stream page link");
+      return;
+    }
     const relays = normalizeRelays([
       ...(communityContext?.relays || []),
       ...configuredPublicRelays,
@@ -1994,9 +2003,15 @@
               </span>
               <h3>{selectedStream.title}</h3>
             </div>
-            <button class="secondary compact" onclick={leaveStream}
-              >Leave stream</button
-            >
+            <div class="stream-actions">
+              <button
+                class="secondary compact"
+                onclick={() => void shareStream(selectedStream)}>Share</button
+              >
+              <button class="secondary compact" onclick={leaveStream}
+                >Leave stream</button
+              >
+            </div>
           </div>
           {#if canModerate}
             <details class="notice">
