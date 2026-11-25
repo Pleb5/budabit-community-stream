@@ -22,10 +22,12 @@
     COMMUNITY_TAG_PREFIX,
     LIVE_CHAT_KIND,
     LIVE_STREAM_KIND,
+    buildEndedStreamTemplate,
     getStreamAddress,
     parseStreamEvent,
     retainVisibleStreams,
     selectLatestStreamReplacements,
+    selectNewerStreamReplacement,
     streamNaddr,
     type CommunityStream,
   } from "./lib/streams";
@@ -73,6 +75,7 @@
     import.meta.env.VITE_STREAM_PROVIDER_URL?.trim() || "";
   const DEFAULT_PUBLIC_RELAYS = [
     "wss://relay.snort.social",
+    "wss://relay.primal.net",
     "wss://nos.lol",
     "wss://relay.damus.io",
     "wss://relay.divine.video/",
@@ -151,6 +154,10 @@
   let reportedBroadcastSetup = "";
   let preparing = $state(false);
   let launchStatus = $state("");
+  let endingAddress = $state("");
+  let lastReconcileAt = 0;
+  let reconcilingStreams = false;
+  const reconciledEventIds = new Set<string>();
 
   let chatMessages = $state<ChatMessage[]>([]);
   let chatProfiles = $state<Record<string, ChatProfile>>({});
@@ -588,6 +595,14 @@
       } else if (joinedRelaysChanged && nextJoinedStream) {
         invalidateChatProfileRefresh();
         startChat(nextJoinedStream);
+      }
+      const activeProviderStreams = nextStreams.filter(
+        (stream) =>
+          (stream.status === "live" || stream.status === "planned") &&
+          trustedProviders.has(stream.event.pubkey.toLowerCase()),
+      );
+      if (activeProviderStreams.length) {
+        void reconcileProviderStreams(activeProviderStreams, expected);
       }
       return "success";
     } catch (error) {
@@ -1464,6 +1479,174 @@
     await copyValue(`https://zap.stream/${naddr}`, "Stream link");
   }
 
+  async function queryPublicStreamReplacements(stream: CommunityStream) {
+    const relays = normalizeRelays([
+      ...configuredPublicRelays,
+      ...selectedPublicRelays,
+      ...stream.relays,
+    ]);
+    if (!relays.length) return [];
+    const scope = `reconcile:${stream.address}`;
+    updatePoolRelayScope(scope, relays);
+    try {
+      const events = await pool.querySync(
+        relays,
+        {
+          kinds: [LIVE_STREAM_KIND],
+          authors: [stream.event.pubkey],
+          "#d": [stream.identifier],
+          limit: 10,
+        },
+        { maxWait: 4_500 },
+      );
+      return events.filter((event): event is Event => verifyEvent(event));
+    } finally {
+      clearPoolRelayScope(scope);
+    }
+  }
+
+  async function publishReplacementToCommunity(
+    event: Event,
+    ctx: CommunityWidgetContext,
+  ) {
+    if (!bridge || !hasNostrControls) return false;
+    const relays = normalizeRelays(ctx.relays || []);
+    if (!relays.length) return false;
+    const response = (await bridge.request("nostr:publish", {
+      event,
+      relays,
+    })) as NostrPublishResponse;
+    if ("error" in response) throw new Error(response.error);
+    const result = response.result as PublishResult | undefined;
+    return result?.successCount !== 0;
+  }
+
+  async function reconcileProviderStreams(
+    targets: CommunityStream[],
+    expected: CommunityWidgetContext,
+  ) {
+    const now = Date.now();
+    if (reconcilingStreams || now - lastReconcileAt < 15_000) return;
+    reconcilingStreams = true;
+    lastReconcileAt = now;
+    try {
+      let updated = false;
+      for (const stream of targets) {
+        if (!contextIsCurrent(expected)) return;
+        const candidates = await queryPublicStreamReplacements(stream);
+        if (!contextIsCurrent(expected)) return;
+        const newer = selectNewerStreamReplacement(
+          stream,
+          candidates,
+          expected.communityId,
+        );
+        if (!newer) continue;
+        const parsed = parseStreamEvent(newer, trustedProviders);
+        if (parsed) {
+          streams = retainVisibleStreams(
+            selectLatestStreamReplacements([...streams, parsed]),
+          ).sort(compareStreams);
+          updated = true;
+        }
+        if (
+          canModerate &&
+          hasNostrControls &&
+          !reconciledEventIds.has(newer.id)
+        ) {
+          reconciledEventIds.add(newer.id);
+          try {
+            await publishReplacementToCommunity(newer, expected);
+          } catch {
+            reconciledEventIds.delete(newer.id);
+          }
+        }
+      }
+      if (updated && contextIsCurrent(expected)) {
+        void loadStreams(expected);
+      }
+    } catch {
+      // Best-effort reconciliation; next poll retries.
+    } finally {
+      reconcilingStreams = false;
+    }
+  }
+
+  async function endStream(stream: CommunityStream) {
+    const ctx = communityContext;
+    if (!bridge || !ctx || !canModerate || endingAddress) return;
+    endingAddress = stream.address;
+    try {
+      if (stream.event.pubkey === ctx.viewer.pubkey) {
+        if (!hasNostrControls) {
+          await showToast(
+            "This host does not allow signing stream updates.",
+            "warning",
+          );
+          return;
+        }
+        const template = buildEndedStreamTemplate(stream);
+        const signResponse = (await bridge.request(
+          "nostr:sign",
+          template,
+        )) as NostrSignResponse;
+        if ("error" in signResponse) throw new Error(signResponse.error);
+        const signed = signResponse.event as Event;
+        if (!verifyEvent(signed)) {
+          throw new Error("The signer returned an invalid event");
+        }
+        const relays = normalizeRelays([
+          ...(ctx.relays || []),
+          ...configuredPublicRelays,
+        ]);
+        const pubResponse = (await bridge.request("nostr:publish", {
+          event: signed,
+          relays,
+        })) as NostrPublishResponse;
+        if ("error" in pubResponse) throw new Error(pubResponse.error);
+        if (joinedAddress === stream.address) leaveStream();
+        await showToast("Stream ended.", "success");
+        void loadStreams(ctx);
+        return;
+      }
+
+      const candidates = await queryPublicStreamReplacements(stream);
+      if (!contextIsCurrent(ctx)) return;
+      const newer = selectNewerStreamReplacement(
+        stream,
+        candidates,
+        ctx.communityId,
+      );
+      const parsed = newer ? parseStreamEvent(newer, trustedProviders) : null;
+      if (newer && parsed && (parsed.status === "ended" || parsed.status === "vod")) {
+        streams = retainVisibleStreams(
+          selectLatestStreamReplacements([...streams, parsed]),
+        ).sort(compareStreams);
+        if (hasNostrControls) {
+          await publishReplacementToCommunity(newer, ctx);
+          reconciledEventIds.add(newer.id);
+        }
+        if (joinedAddress === stream.address) leaveStream();
+        await showToast(
+          "Stream ended and synced to the community relay.",
+          "success",
+        );
+        void loadStreams(ctx);
+      } else {
+        await showToast(
+          "Provider still reports this stream as live. Stop Streaming in OBS, wait ~15s, then click End stream again.",
+          "warning",
+        );
+      }
+    } catch (error) {
+      await showToast(
+        error instanceof Error ? error.message : "Could not end stream",
+        "error",
+      );
+    } finally {
+      endingAddress = "";
+    }
+  }
+
   function formatDate(seconds?: number) {
     if (!seconds) return "";
     return new Intl.DateTimeFormat(undefined, {
@@ -2008,6 +2191,17 @@
                 class="secondary compact"
                 onclick={() => void shareStream(selectedStream)}>Share</button
               >
+              {#if canModerate && selectedStream.status === "live"}
+                <button
+                  class="secondary compact"
+                  disabled={endingAddress === selectedStream.address}
+                  onclick={() => void endStream(selectedStream)}
+                >
+                  {endingAddress === selectedStream.address
+                    ? "Ending…"
+                    : "End stream"}
+                </button>
+              {/if}
               <button class="secondary compact" onclick={leaveStream}
                 >Leave stream</button
               >
@@ -2175,6 +2369,17 @@
                   class="secondary compact"
                   onclick={() => void shareStream(stream)}>Share</button
                 >
+                {#if canModerate && stream.status === "live"}
+                  <button
+                    class="secondary compact"
+                    disabled={endingAddress === stream.address}
+                    onclick={() => void endStream(stream)}
+                  >
+                    {endingAddress === stream.address
+                      ? "Ending…"
+                      : "End stream"}
+                  </button>
+                {/if}
               </div>
             </article>
           {/each}

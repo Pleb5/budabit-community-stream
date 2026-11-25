@@ -165,3 +165,45 @@ export const streamNaddr = (stream: CommunityStream, relays: string[]) =>
     identifier: stream.identifier,
     relays: Array.from(new Set(relays)).slice(0, 5),
   });
+
+export const isNewerEvent = (candidate: Event, current: Event) =>
+  candidate.created_at > current.created_at ||
+  (candidate.created_at === current.created_at &&
+    candidate.id.localeCompare(current.id) < 0);
+
+export const selectNewerStreamReplacement = (
+  current: CommunityStream,
+  candidates: Event[],
+  communityId: string,
+) => {
+  let latest: Event | undefined;
+  for (const event of candidates) {
+    if (
+      event.kind !== LIVE_STREAM_KIND ||
+      event.pubkey !== current.event.pubkey ||
+      tagValue(event, "d") !== current.identifier ||
+      !hasCommunityTag(event, communityId) ||
+      !isNewerEvent(event, current.event)
+    ) {
+      continue;
+    }
+    if (!latest || isNewerEvent(event, latest)) latest = event;
+  }
+  return latest;
+};
+
+export const buildEndedStreamTemplate = (
+  stream: CommunityStream,
+  now = Math.floor(Date.now() / 1000),
+) => {
+  const tags = stream.event.tags.filter(
+    (tag) => tag[0] !== "status" && tag[0] !== "ends" && tag[0] !== "streaming",
+  );
+  tags.push(["status", "ended"], ["ends", String(now)]);
+  return {
+    kind: LIVE_STREAM_KIND,
+    created_at: Math.max(now, stream.event.created_at + 1),
+    content: stream.event.content,
+    tags,
+  };
+};
