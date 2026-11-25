@@ -16,6 +16,7 @@
   let fullscreen = $state(false);
   let presentationError = $state("");
   let autoplayNotice = $state("");
+  let reloadNonce = $state(0);
   const audioPolicy = new StreamAudioPolicy();
   let playbackAttempt = 0;
   let defaultedStream: string | undefined;
@@ -87,6 +88,7 @@
   }
 
   $effect(() => {
+    void reloadNonce;
     const element = video;
     const source = src;
     if (!element || !source) return;
@@ -134,6 +136,7 @@
   <div class="player-controls">
     <button onclick={chooseAudio}>{muted ? "Unmute stream" : "Mute stream"}</button>
     <button onclick={() => void toggleFullscreen()}>{fullscreen ? "Exit full screen" : "Full screen stream"}</button>
+    <button onclick={() => { error = ""; reloadNonce += 1; }}>Reload stream</button>
   </div>
   <video
     bind:this={video}
