@@ -77,7 +77,6 @@
     "wss://relay.snort.social",
     "wss://relay.primal.net",
     "wss://nos.lol",
-    "wss://relay.damus.io",
     "wss://relay.divine.video/",
   ];
   const DEFAULT_TRUSTED_PROVIDERS = [
